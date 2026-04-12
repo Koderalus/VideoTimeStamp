@@ -1,0 +1,13 @@
+# Processed output and logs — not committed
+output/
+logs/
+
+# Sample/test files
+SampleFiles/
+
+# macOS noise
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc

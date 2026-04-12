@@ -1,0 +1,369 @@
+"""
+processor.py — Core video processing logic for VideoTimeStamp.
+
+Handles:
+  - Device detection from container header (Apple vs Sony vs Unknown)
+  - Metadata extraction (creation_time from mvhd atom)
+  - Timezone resolution (UTC for Apple, local for Sony/Unknown)
+  - FFmpeg drawtext filter construction
+  - Batch processing with progress/result callbacks
+  - Session logging to logs/
+"""
+
+import struct
+import subprocess
+import mmap
+import os
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# MP4/MOV timestamps are seconds since 1904-01-01 00:00:00 UTC
+MAC_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
+
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.mts', '.m4v', '.wmv'}
+
+TIMEZONES = [
+    {
+        "label":        "AEST (UTC+10:00) \u2014 QLD, NSW, VIC, TAS, ACT",
+        "abbreviation": "AEST",
+        "offset":       timedelta(hours=10),
+        "posix_tz":     "AEST-10",
+    },
+    {
+        "label":        "AEDT (UTC+11:00) \u2014 NSW, VIC, TAS, ACT (DST)",
+        "abbreviation": "AEDT",
+        "offset":       timedelta(hours=11),
+        "posix_tz":     "AEDT-11",
+    },
+    {
+        "label":        "ACST (UTC+09:30) \u2014 SA, NT",
+        "abbreviation": "ACST",
+        "offset":       timedelta(hours=9, minutes=30),
+        "posix_tz":     "ACST-9:30",
+    },
+    {
+        "label":        "ACDT (UTC+10:30) \u2014 SA (DST)",
+        "abbreviation": "ACDT",
+        "offset":       timedelta(hours=10, minutes=30),
+        "posix_tz":     "ACDT-10:30",
+    },
+    {
+        "label":        "AWST (UTC+08:00) \u2014 WA",
+        "abbreviation": "AWST",
+        "offset":       timedelta(hours=8),
+        "posix_tz":     "AWST-8",
+    },
+]
+
+TEXT_STYLES = [
+    {
+        "label":          "White text only",
+        "extra_params":   "",
+    },
+    {
+        "label":          "White text with black outline",
+        "extra_params":   ":borderw=2:bordercolor=black",
+    },
+    {
+        "label":          "White text with background box",
+        "extra_params":   ":box=1:boxcolor=black@0.5:boxborderw=5",
+    },
+]
+
+# Convenience look-ups
+TIMEZONE_LABELS    = [tz["label"] for tz in TIMEZONES]
+TIMEZONE_BY_LABEL  = {tz["label"]: tz for tz in TIMEZONES}
+TEXT_STYLE_LABELS  = [s["label"]  for s in TEXT_STYLES]
+TEXT_STYLE_BY_LABEL = {s["label"]: s for s in TEXT_STYLES}
+
+DEVICE_LABELS = {
+    "apple":   "Apple",
+    "sony":    "Sony",
+    "unknown": "Unknown",
+}
+
+
+# ── FFmpeg check ──────────────────────────────────────────────────────────────
+
+def check_ffmpeg():
+    """Return True if ffmpeg is available on PATH."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+# ── Device detection ──────────────────────────────────────────────────────────
+
+def detect_device(filepath):
+    """
+    Detect the recording device from the file's ftyp container header.
+
+    Returns:
+        'apple'   — QuickTime container (iPhone/iPad). mvhd stores UTC.
+        'sony'    — Sony MSNV container. mvhd stores local time.
+        'unknown' — No recognised header. Treat mvhd as local time, warn user.
+    """
+    with open(filepath, "rb") as f:
+        header = f.read(32)
+
+    idx = header.find(b"ftyp")
+    if idx == -1:
+        return "unknown"
+
+    brand = header[idx + 4 : idx + 8]
+    if brand == b"qt  ":
+        return "apple"
+    if brand == b"MSNV":
+        return "sony"
+    return "unknown"
+
+
+# ── Metadata extraction ───────────────────────────────────────────────────────
+
+def get_creation_time(filepath):
+    """
+    Extract the creation_time from the mvhd atom.
+
+    The value is always returned as a UTC-aware datetime — but note that
+    for Sony/Unknown devices this UTC label is technically wrong (they
+    store local time). The caller (resolve_unix_timestamp) corrects this.
+
+    Returns a datetime or None if the atom is missing or zero.
+    """
+    with open(filepath, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        idx = mm.find(b"mvhd")
+        if idx == -1:
+            mm.close()
+            return None
+        version = mm[idx + 4]
+        if version == 1:
+            ts = struct.unpack(">Q", bytes(mm[idx + 8 : idx + 16]))[0]
+        else:
+            ts = struct.unpack(">I", bytes(mm[idx + 8 : idx + 12]))[0]
+        mm.close()
+
+    if ts == 0:
+        return None
+    return MAC_EPOCH + timedelta(seconds=ts)
+
+
+# ── Timezone resolution ───────────────────────────────────────────────────────
+
+def resolve_unix_timestamp(creation_time, device_type, tz_offset):
+    """
+    Convert the raw mvhd datetime to a UTC Unix timestamp for FFmpeg.
+
+    Apple  → mvhd is already UTC; use timestamp() directly.
+    Others → mvhd is local time; attach the selected timezone offset
+             and convert to UTC.
+    """
+    if device_type == "apple":
+        return int(creation_time.timestamp())
+    else:
+        local_dt = creation_time.replace(tzinfo=timezone(tz_offset))
+        return int(local_dt.timestamp())
+
+
+# ── Font discovery ────────────────────────────────────────────────────────────
+
+def find_system_font():
+    """
+    Return a path to a usable TrueType font on macOS or Linux.
+    Returns None if no known font is found (FFmpeg will use its built-in).
+    """
+    candidates = [
+        # macOS (Intel + Apple Silicon)
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        # Linux fallbacks
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# ── FFmpeg filter construction ────────────────────────────────────────────────
+
+def build_drawtext_filter(unix_ts, text_style_label):
+    """
+    Build the FFmpeg drawtext filter string.
+
+    The timestamp advances frame-by-frame using FFmpeg's pts:localtime
+    mechanism. FFmpeg reads the TZ environment variable (set per-process
+    in process_video) to format the time in the correct timezone.
+
+    Format: dd/mm/yyyy hh:mm:ss AM/PM  (bottom-right, 10px padding)
+    """
+    style = TEXT_STYLE_BY_LABEL.get(text_style_label, TEXT_STYLES[0])
+    extra = style["extra_params"]
+
+    font_path = find_system_font()
+    font_clause = f":fontfile='{font_path}'" if font_path else ""
+
+    # strftime format — colons inside the pts:localtime expression must be \:
+    fmt = r"%d/%m/%Y %I\:%M\:%S %p"
+    text_val = f"%{{pts\\:localtime\\:{unix_ts}\\:{fmt}}}"
+
+    return (
+        f"drawtext="
+        f"text='{text_val}'"
+        f":fontsize=24"
+        f":fontcolor=white"
+        f":x=w-tw-10"
+        f":y=h-th-10"
+        f"{font_clause}"
+        f"{extra}"
+    )
+
+
+# ── Single-file processing ────────────────────────────────────────────────────
+
+def process_video(input_path, output_path, unix_ts, text_style_label, posix_tz):
+    """
+    Burn the timestamp overlay onto a single video using FFmpeg.
+
+    Quality: libx264 CRF 18 (visually lossless). Audio stream-copied.
+    The TZ env var is set per-process so FFmpeg formats in the correct timezone.
+
+    Returns: (success: bool, stderr: str)
+    """
+    drawtext = build_drawtext_filter(unix_ts, text_style_label)
+
+    env = os.environ.copy()
+    env["TZ"] = posix_tz
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vf", drawtext,
+        "-c:v", "libx264",
+        "-crf", "18",
+        "-preset", "slow",
+        "-c:a", "copy",
+        str(output_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    return result.returncode == 0, result.stderr
+
+
+# ── Batch processing ──────────────────────────────────────────────────────────
+
+def process_folder(
+    input_dir,
+    output_dir,
+    timezone_label,
+    text_style_label,
+    on_progress=None,
+    on_result=None,
+    log_dir=None,
+):
+    """
+    Process all video files found in input_dir.
+
+    Args:
+        input_dir       : Path to folder containing source videos.
+        output_dir      : Path to folder for timestamped output videos.
+        timezone_label  : Key from TIMEZONE_LABELS selected by the user.
+        text_style_label: Key from TEXT_STYLE_LABELS selected by the user.
+        on_progress     : Optional callback(current, total, filename).
+        on_result       : Optional callback(filename, device, success, message).
+        log_dir         : Optional path to write a session log file.
+    """
+    input_dir  = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tz_info   = TIMEZONE_BY_LABEL[timezone_label]
+    tz_offset = tz_info["offset"]
+    posix_tz  = tz_info["posix_tz"]
+
+    # ── Session log ───────────────────────────────────────────────────────────
+    logger = None
+    if log_dir:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_path / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
+        logger = logging.getLogger(f"vts.{log_file.stem}")
+        logger.setLevel(logging.INFO)
+        logger.addHandler(file_handler)
+        logger.propagate = False
+
+    # ── File discovery ────────────────────────────────────────────────────────
+    files = sorted(
+        f for f in input_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+    )
+    total = len(files)
+
+    if logger:
+        logger.info(
+            f"Session start — {total} file(s) | "
+            f"Timezone: {tz_info['abbreviation']} ({posix_tz}) | "
+            f"Style: {text_style_label}"
+        )
+
+    # ── Per-file loop ─────────────────────────────────────────────────────────
+    for i, filepath in enumerate(files):
+        if on_progress:
+            on_progress(i, total, filepath.name)
+
+        device        = detect_device(filepath)
+        creation_time = get_creation_time(filepath)
+
+        if creation_time is None:
+            msg = "No metadata timestamp — skipped"
+            if on_result:
+                on_result(filepath.name, device, False, msg)
+            if logger:
+                logger.warning(f"SKIP  {filepath.name}  [{DEVICE_LABELS[device]}]  — {msg}")
+            continue
+
+        unix_ts     = resolve_unix_timestamp(creation_time, device, tz_offset)
+        output_path = output_dir / filepath.name
+
+        success, stderr = process_video(
+            filepath, output_path, unix_ts, text_style_label, posix_tz
+        )
+
+        if success:
+            msg = str(output_path)
+            if logger:
+                logger.info(f"OK    {filepath.name}  [{DEVICE_LABELS[device]}]  → {output_path}")
+        else:
+            msg = "FFmpeg error — check session log"
+            if logger:
+                # Keep only the last 800 chars of stderr to avoid huge logs
+                logger.error(
+                    f"FAIL  {filepath.name}  [{DEVICE_LABELS[device]}]\n"
+                    f"{stderr[-800:].strip()}"
+                )
+
+        if on_result:
+            on_result(filepath.name, device, success, msg)
+
+    # ── Done ──────────────────────────────────────────────────────────────────
+    if on_progress:
+        on_progress(total, total, "")
+
+    if logger:
+        logger.info("Session complete")
+        for h in logger.handlers:
+            h.close()
+        logger.handlers.clear()
