@@ -37,12 +37,6 @@ if ! command -v ffprobe &>/dev/null; then
     exit 1
 fi
 
-# ── Pillow (Python image library for text overlay) ────────────────────────────
-# Text is burned onto frames using Pillow — no special FFmpeg compilation needed.
-echo "Installing Pillow (image processing library)..."
-"$BREW_PYTHON" -m pip install --quiet --upgrade Pillow
-echo "✓ Pillow installed"
-
 # ── Python 3 (Homebrew) ───────────────────────────────────────────────────────
 # macOS ships with an old system Python + Tk 8.5 which breaks the GUI.
 # We install Python and Tk via Homebrew to get a modern, supported version.
@@ -75,6 +69,12 @@ fi
 
 # Write the Python path so run.sh always uses the right interpreter
 echo "$BREW_PYTHON" > .python_path
+
+# ── Pillow (Python image library for text overlay) ────────────────────────────
+# Text is burned onto frames using Pillow — no special FFmpeg compilation needed.
+echo "Installing Pillow (image processing library)..."
+"$BREW_PYTHON" -m pip install --quiet --upgrade Pillow
+echo "✓ Pillow installed"
 
 # ── Folders ───────────────────────────────────────────────────────────────────
 mkdir -p input output logs
