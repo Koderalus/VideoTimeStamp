@@ -37,13 +37,38 @@ if ! command -v ffprobe &>/dev/null; then
     exit 1
 fi
 
-# ── Python 3 ──────────────────────────────────────────────────────────────────
-if command -v python3 &>/dev/null; then
-    echo "✓ Python: $(python3 --version)"
+# ── Python 3 (Homebrew) ───────────────────────────────────────────────────────
+# macOS ships with an old system Python + Tk 8.5 which breaks the GUI.
+# We install Python and Tk via Homebrew to get a modern, supported version.
+BREW_PYTHON=""
+for ver in 3.13 3.12 3.11; do
+    if [[ -f "/opt/homebrew/bin/python${ver}" ]]; then
+        BREW_PYTHON="/opt/homebrew/bin/python${ver}"
+        break
+    fi
+done
+
+if [[ -n "$BREW_PYTHON" ]]; then
+    echo "✓ Homebrew Python: $($BREW_PYTHON --version)"
 else
-    echo "ERROR: python3 not found. Install via: brew install python3"
-    exit 1
+    echo "Installing Python 3 via Homebrew..."
+    brew install python@3.13
+    BREW_PYTHON="/opt/homebrew/bin/python3.13"
+    echo "✓ Python installed: $($BREW_PYTHON --version)"
 fi
+
+# Install matching Tk bindings
+PYVER=$($BREW_PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if brew list "python-tk@${PYVER}" &>/dev/null 2>&1; then
+    echo "✓ Tk bindings already installed"
+else
+    echo "Installing Tk bindings for Python ${PYVER}..."
+    brew install "python-tk@${PYVER}" || brew install python-tk
+    echo "✓ Tk bindings installed"
+fi
+
+# Write the Python path so run.sh always uses the right interpreter
+echo "$BREW_PYTHON" > .python_path
 
 # ── Folders ───────────────────────────────────────────────────────────────────
 mkdir -p input output logs
@@ -72,13 +97,7 @@ echo "====================================="
 echo "  Setup complete"
 echo "====================================="
 echo ""
-echo "  To launch the app:"
-echo "    python3 app.py"
+echo "  To launch the app, double-click run.sh"
+echo "  or run in Terminal:"
+echo "    bash run.sh"
 echo ""
-
-# Remind Apple Silicon users to add Homebrew to their shell profile
-if [[ -f /opt/homebrew/bin/brew ]] && ! grep -q 'homebrew' ~/.zprofile 2>/dev/null; then
-    echo "  NOTE: Add Homebrew to your PATH permanently by running:"
-    echo "    echo 'eval \"\$(/opt/homebrew/bin/brew shellenv)\"' >> ~/.zprofile"
-    echo ""
-fi

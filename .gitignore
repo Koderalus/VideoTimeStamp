@@ -2,6 +2,9 @@
 output/
 logs/
 
+# Machine-specific Python path written by install.sh
+.python_path
+
 # Sample/test files
 SampleFiles/
 
