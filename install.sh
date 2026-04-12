@@ -24,8 +24,24 @@ else
 fi
 
 # ── FFmpeg ────────────────────────────────────────────────────────────────────
+# freetype is required for the drawtext filter (burns text onto video frames).
+# Install it before FFmpeg so the FFmpeg bottle links against it correctly.
+if brew list freetype &>/dev/null 2>&1; then
+    echo "✓ freetype already installed"
+else
+    echo "Installing freetype (required for timestamp overlay)..."
+    brew install freetype
+fi
+
 if command -v ffmpeg &>/dev/null; then
-    echo "✓ FFmpeg: $(ffmpeg -version 2>&1 | head -1)"
+    # Check that this FFmpeg build actually includes the drawtext filter.
+    if ffmpeg -filters 2>/dev/null | grep -q drawtext; then
+        echo "✓ FFmpeg: $(ffmpeg -version 2>&1 | head -1)"
+    else
+        echo "FFmpeg is installed but missing the drawtext filter — reinstalling..."
+        brew reinstall ffmpeg
+        echo "✓ FFmpeg reinstalled with drawtext support"
+    fi
 else
     echo "Installing FFmpeg (this may take a few minutes)..."
     brew install ffmpeg
@@ -36,6 +52,15 @@ if ! command -v ffprobe &>/dev/null; then
     echo "ERROR: ffprobe not found after install. Try: brew reinstall ffmpeg"
     exit 1
 fi
+
+# Final check — abort early with a clear message if drawtext is still missing.
+if ! ffmpeg -filters 2>/dev/null | grep -q drawtext; then
+    echo ""
+    echo "ERROR: FFmpeg drawtext filter still not available."
+    echo "Please contact your technician with this message."
+    exit 1
+fi
+echo "✓ FFmpeg drawtext filter confirmed"
 
 # ── Python 3 (Homebrew) ───────────────────────────────────────────────────────
 # macOS ships with an old system Python + Tk 8.5 which breaks the GUI.
