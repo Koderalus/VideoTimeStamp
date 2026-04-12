@@ -303,9 +303,11 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     width, height, fps = info["width"], info["height"], info["fps"]
     frame_size = width * height * 3  # RGB24 bytes per frame
 
-    # ── Font ──────────────────────────────────────────────────────────────────
-    font_path = find_system_font()
-    font_size = max(20, height // 28)
+    # ── Font and scale-aware measurements ────────────────────────────────────
+    font_path    = find_system_font()
+    font_size    = max(20, height // 28)
+    edge_padding = max(20, width  // 60)   # distance from frame edge (scales with resolution)
+    outline_w    = max(2,  font_size // 10) # outline thickness scales with font size
     try:
         font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
     except Exception:
@@ -364,12 +366,12 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
             img  = Image.frombytes("RGB", (width, height), raw)
             draw = ImageDraw.Draw(img)
 
-            # Measure text dimensions
+            # Measure text dimensions and position (bottom-right with scaled padding)
             bbox   = draw.textbbox((0, 0), ts_text, font=font)
             text_w = bbox[2] - bbox[0]
             text_h = bbox[3] - bbox[1]
-            x = width  - text_w - 10
-            y = height - text_h - 10
+            x = width  - text_w - edge_padding
+            y = height - text_h - edge_padding
 
             style_name = text_style_label
 
@@ -377,17 +379,19 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
                 draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
 
             elif style_name == "White text with black outline":
-                for ox, oy in [(-2, 0), (2, 0), (0, -2), (0, 2),
-                                (-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                ow = outline_w
+                for ox, oy in [(-ow, 0), (ow, 0), (0, -ow), (0, ow),
+                                (-ow, -ow), (ow, -ow), (-ow, ow), (ow, ow)]:
                     draw.text((x + ox, y + oy), ts_text, font=font, fill=(0, 0, 0))
                 draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
 
             elif style_name == "White text with background box":
-                pad = 6
+                box_pad = max(6, font_size // 8)
                 overlay    = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                 ov_draw    = ImageDraw.Draw(overlay)
                 ov_draw.rectangle(
-                    [x - pad, y - pad, x + text_w + pad, y + text_h + pad],
+                    [x - box_pad, y - box_pad,
+                     x + text_w + box_pad, y + text_h + box_pad],
                     fill=(0, 0, 0, 128),
                 )
                 img  = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
