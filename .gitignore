@@ -2,8 +2,9 @@
 output/
 logs/
 
-# Machine-specific Python path written by install.sh
+# Machine-specific files written by install.sh
 .python_path
+.venv/
 
 # Sample/test files
 SampleFiles/

@@ -3,6 +3,8 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo ""
 echo "====================================="
 echo "  VideoTimeStamp — Setup"
@@ -67,23 +69,33 @@ else
     echo "✓ Tk bindings installed"
 fi
 
-# Write the Python path so run.sh always uses the right interpreter
-echo "$BREW_PYTHON" > .python_path
+# ── Virtual environment + Pillow ──────────────────────────────────────────────
+# Python 3.12+ blocks pip from installing into Homebrew Python directly (PEP 668).
+# A virtual environment sidesteps this cleanly.
+VENV_DIR="$SCRIPT_DIR/.venv"
+if [[ ! -d "$VENV_DIR" ]]; then
+    echo "Creating virtual environment..."
+    "$BREW_PYTHON" -m venv "$VENV_DIR"
+    echo "✓ Virtual environment created"
+else
+    echo "✓ Virtual environment already exists"
+fi
 
-# ── Pillow (Python image library for text overlay) ────────────────────────────
-# Text is burned onto frames using Pillow — no special FFmpeg compilation needed.
+VENV_PYTHON="$VENV_DIR/bin/python"
+
 echo "Installing Pillow (image processing library)..."
-"$BREW_PYTHON" -m pip install --quiet --upgrade Pillow
+"$VENV_PYTHON" -m pip install --quiet --upgrade Pillow
 echo "✓ Pillow installed"
 
+# Write the venv Python path so run.sh always uses the right interpreter
+echo "$VENV_PYTHON" > "$SCRIPT_DIR/.python_path"
+
 # ── Folders ───────────────────────────────────────────────────────────────────
-mkdir -p input output logs
+mkdir -p "$SCRIPT_DIR/input" "$SCRIPT_DIR/output" "$SCRIPT_DIR/logs"
 echo "✓ Folders ready: input/  output/  logs/"
 
 # ── Default config ────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.json"
-
 if [[ ! -f "$CONFIG" ]]; then
     cat > "$CONFIG" << 'EOF'
 {
@@ -103,7 +115,6 @@ echo "====================================="
 echo "  Setup complete"
 echo "====================================="
 echo ""
-echo "  To launch the app, double-click run.sh"
-echo "  or run in Terminal:"
+echo "  To launch the app, run in Terminal:"
 echo "    bash run.sh"
 echo ""
