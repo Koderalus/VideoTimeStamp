@@ -1,26 +1,28 @@
 """
 processor.py — Core video processing logic for VideoTimeStamp.
 
-Handles:
-  - Device detection from container header (Apple vs Sony vs Unknown)
-  - Metadata extraction (creation_time from mvhd atom)
-  - Timezone resolution (UTC for Apple, local for Sony/Unknown)
-  - FFmpeg drawtext filter construction
-  - Batch processing with progress/result callbacks
-  - Session logging to logs/
+Text overlay uses Pillow (frame-by-frame) rather than FFmpeg's drawtext filter,
+so it works regardless of how FFmpeg was compiled.
 """
 
+import json
+import os
 import struct
 import subprocess
 import mmap
-import os
+import tempfile
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# MP4/MOV timestamps are seconds since 1904-01-01 00:00:00 UTC
 MAC_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.mts', '.m4v', '.wmv'}
@@ -60,23 +62,19 @@ TIMEZONES = [
 
 TEXT_STYLES = [
     {
-        "label":          "White text only",
-        "extra_params":   "",
+        "label": "White text only",
     },
     {
-        "label":          "White text with black outline",
-        "extra_params":   ":borderw=2:bordercolor=black",
+        "label": "White text with black outline",
     },
     {
-        "label":          "White text with background box",
-        "extra_params":   ":box=1:boxcolor=black@0.5:boxborderw=5",
+        "label": "White text with background box",
     },
 ]
 
-# Convenience look-ups
-TIMEZONE_LABELS    = [tz["label"] for tz in TIMEZONES]
-TIMEZONE_BY_LABEL  = {tz["label"]: tz for tz in TIMEZONES}
-TEXT_STYLE_LABELS  = [s["label"]  for s in TEXT_STYLES]
+TIMEZONE_LABELS     = [tz["label"] for tz in TIMEZONES]
+TIMEZONE_BY_LABEL   = {tz["label"]: tz for tz in TIMEZONES}
+TEXT_STYLE_LABELS   = [s["label"] for s in TEXT_STYLES]
 TEXT_STYLE_BY_LABEL = {s["label"]: s for s in TEXT_STYLES}
 
 DEVICE_LABELS = {
@@ -86,40 +84,39 @@ DEVICE_LABELS = {
 }
 
 
-# ── FFmpeg check ──────────────────────────────────────────────────────────────
+# ── FFmpeg / Pillow checks ────────────────────────────────────────────────────
 
 def check_ffmpeg():
     """Return True if ffmpeg is available on PATH."""
     try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            check=True,
-        )
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         return True
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
+
+
+def check_pillow():
+    """Return True if Pillow is importable."""
+    return PILLOW_AVAILABLE
 
 
 # ── Device detection ──────────────────────────────────────────────────────────
 
 def detect_device(filepath):
     """
-    Detect the recording device from the file's ftyp container header.
+    Detect the recording device from the ftyp container header.
 
     Returns:
-        'apple'   — QuickTime container (iPhone/iPad). mvhd stores UTC.
+        'apple'   — QuickTime (iPhone/iPad). mvhd stores UTC.
         'sony'    — Sony MSNV container. mvhd stores local time.
-        'unknown' — No recognised header. Treat mvhd as local time, warn user.
+        'unknown' — Unrecognised header. Treat mvhd as local time.
     """
     with open(filepath, "rb") as f:
         header = f.read(32)
-
     idx = header.find(b"ftyp")
     if idx == -1:
         return "unknown"
-
-    brand = header[idx + 4 : idx + 8]
+    brand = header[idx + 4: idx + 8]
     if brand == b"qt  ":
         return "apple"
     if brand == b"MSNV":
@@ -131,13 +128,8 @@ def detect_device(filepath):
 
 def get_creation_time(filepath):
     """
-    Extract the creation_time from the mvhd atom.
-
-    The value is always returned as a UTC-aware datetime — but note that
-    for Sony/Unknown devices this UTC label is technically wrong (they
-    store local time). The caller (resolve_unix_timestamp) corrects this.
-
-    Returns a datetime or None if the atom is missing or zero.
+    Extract creation_time from the mvhd atom.
+    Returns a UTC-aware datetime, or None if missing/zero.
     """
     with open(filepath, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -147,11 +139,10 @@ def get_creation_time(filepath):
             return None
         version = mm[idx + 4]
         if version == 1:
-            ts = struct.unpack(">Q", bytes(mm[idx + 8 : idx + 16]))[0]
+            ts = struct.unpack(">Q", bytes(mm[idx + 8: idx + 16]))[0]
         else:
-            ts = struct.unpack(">I", bytes(mm[idx + 8 : idx + 12]))[0]
+            ts = struct.unpack(">I", bytes(mm[idx + 8: idx + 12]))[0]
         mm.close()
-
     if ts == 0:
         return None
     return MAC_EPOCH + timedelta(seconds=ts)
@@ -161,11 +152,9 @@ def get_creation_time(filepath):
 
 def resolve_unix_timestamp(creation_time, device_type, tz_offset):
     """
-    Convert the raw mvhd datetime to a UTC Unix timestamp for FFmpeg.
-
-    Apple  → mvhd is already UTC; use timestamp() directly.
-    Others → mvhd is local time; attach the selected timezone offset
-             and convert to UTC.
+    Convert mvhd datetime to a UTC Unix timestamp.
+    Apple: mvhd is UTC — use directly.
+    Sony/Unknown: mvhd is local time — attach selected tz, convert to UTC.
     """
     if device_type == "apple":
         return int(creation_time.timestamp())
@@ -177,16 +166,12 @@ def resolve_unix_timestamp(creation_time, device_type, tz_offset):
 # ── Font discovery ────────────────────────────────────────────────────────────
 
 def find_system_font():
-    """
-    Return a path to a usable TrueType font on macOS or Linux.
-    Returns None if no known font is found (FFmpeg will use its built-in).
-    """
+    """Return a path to a usable TrueType font on macOS or Linux."""
     candidates = [
-        # macOS (Intel + Apple Silicon)
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        # Linux fallbacks
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
     ]
@@ -196,69 +181,166 @@ def find_system_font():
     return None
 
 
-# ── FFmpeg filter construction ────────────────────────────────────────────────
+# ── Timestamp formatting ──────────────────────────────────────────────────────
 
-def build_drawtext_filter(unix_ts, text_style_label):
+def format_timestamp(unix_ts, tz_offset):
+    """Format a Unix timestamp as dd/mm/yyyy hh:mm:ss AM/PM in the given timezone."""
+    dt = datetime.fromtimestamp(unix_ts, tz=timezone(tz_offset))
+    return dt.strftime("%d/%m/%Y %I:%M:%S %p")
+
+
+# ── Video info ────────────────────────────────────────────────────────────────
+
+def get_video_info(filepath):
+    """Return width, height, and fps of the first video stream via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        str(filepath),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    data = json.loads(result.stdout)
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = int(stream["width"])
+            height = int(stream["height"])
+            num, den = map(int, stream.get("r_frame_rate", "25/1").split("/"))
+            fps = num / den
+            return {"width": width, "height": height, "fps": fps}
+    raise ValueError(f"No video stream found in {filepath}")
+
+
+# ── Frame-by-frame processing with Pillow ─────────────────────────────────────
+
+def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset):
     """
-    Build the FFmpeg drawtext filter string.
+    Burn the timestamp overlay onto a video using Pillow for text rendering.
 
-    The timestamp advances frame-by-frame using FFmpeg's pts:localtime
-    mechanism. FFmpeg reads the TZ environment variable (set per-process
-    in process_video) to format the time in the correct timezone.
-
-    Format: dd/mm/yyyy hh:mm:ss AM/PM  (bottom-right, 10px padding)
-    """
-    style = TEXT_STYLE_BY_LABEL.get(text_style_label, TEXT_STYLES[0])
-    extra = style["extra_params"]
-
-    font_path = find_system_font()
-    font_clause = f":fontfile='{font_path}'" if font_path else ""
-
-    # strftime format — colons inside the pts:localtime expression must be \:
-    fmt = r"%d/%m/%Y %I\:%M\:%S %p"
-    text_val = f"%{{pts\\:localtime\\:{unix_ts}\\:{fmt}}}"
-
-    return (
-        f"drawtext="
-        f"text='{text_val}'"
-        f":fontsize=24"
-        f":fontcolor=white"
-        f":x=w-tw-10"
-        f":y=h-th-10"
-        f"{font_clause}"
-        f"{extra}"
-    )
-
-
-# ── Single-file processing ────────────────────────────────────────────────────
-
-def process_video(input_path, output_path, unix_ts, text_style_label, posix_tz):
-    """
-    Burn the timestamp overlay onto a single video using FFmpeg.
-
-    Quality: libx264 CRF 18 (visually lossless). Audio stream-copied.
-    The TZ env var is set per-process so FFmpeg formats in the correct timezone.
+    FFmpeg decodes raw frames → Python/Pillow draws text → FFmpeg re-encodes.
+    Quality: libx264 CRF 18. Audio is stream-copied.
 
     Returns: (success: bool, stderr: str)
     """
-    drawtext = build_drawtext_filter(unix_ts, text_style_label)
+    if not PILLOW_AVAILABLE:
+        return False, "Pillow is not installed. Run: bash install.sh"
 
-    env = os.environ.copy()
-    env["TZ"] = posix_tz
+    info = get_video_info(input_path)
+    width, height, fps = info["width"], info["height"], info["fps"]
+    frame_size = width * height * 3  # RGB24 bytes per frame
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-vf", drawtext,
-        "-c:v", "libx264",
-        "-crf", "18",
-        "-preset", "slow",
-        "-c:a", "copy",
-        str(output_path),
+    # ── Font ──────────────────────────────────────────────────────────────────
+    font_path = find_system_font()
+    font_size = max(20, height // 28)
+    try:
+        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+
+    # ── Extract audio to a temp file ──────────────────────────────────────────
+    tmp_audio = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+    tmp_audio.close()
+
+    audio_result = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(input_path), "-vn", "-acodec", "copy", tmp_audio.name],
+        capture_output=True,
+    )
+    has_audio = audio_result.returncode == 0 and os.path.getsize(tmp_audio.name) > 0
+
+    # ── Decode process (video frames → stdout) ────────────────────────────────
+    decode_cmd = [
+        "ffmpeg", "-i", str(input_path),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-an",
+        "pipe:1",
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    return result.returncode == 0, result.stderr
+    # ── Encode process (stdin → output file) ──────────────────────────────────
+    encode_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+    ]
+    if has_audio:
+        encode_cmd += ["-i", tmp_audio.name]
+    encode_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
+    if has_audio:
+        encode_cmd += ["-c:a", "copy"]
+    encode_cmd += [str(output_path)]
+
+    decode_proc = subprocess.Popen(
+        decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    encode_proc = subprocess.Popen(
+        encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    success = True
+    stderr  = ""
+    frame_num = 0
+
+    try:
+        while True:
+            raw = decode_proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+
+            frame_unix_ts = unix_ts + (frame_num / fps)
+            ts_text = format_timestamp(frame_unix_ts, tz_offset)
+
+            img  = Image.frombytes("RGB", (width, height), raw)
+            draw = ImageDraw.Draw(img)
+
+            # Measure text dimensions
+            bbox   = draw.textbbox((0, 0), ts_text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            x = width  - text_w - 10
+            y = height - text_h - 10
+
+            style_name = text_style_label
+
+            if style_name == "White text only":
+                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+            elif style_name == "White text with black outline":
+                for ox, oy in [(-2, 0), (2, 0), (0, -2), (0, 2),
+                                (-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                    draw.text((x + ox, y + oy), ts_text, font=font, fill=(0, 0, 0))
+                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+            elif style_name == "White text with background box":
+                pad = 6
+                overlay    = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                ov_draw    = ImageDraw.Draw(overlay)
+                ov_draw.rectangle(
+                    [x - pad, y - pad, x + text_w + pad, y + text_h + pad],
+                    fill=(0, 0, 0, 128),
+                )
+                img  = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+                draw = ImageDraw.Draw(img)
+                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+            encode_proc.stdin.write(img.tobytes())
+            frame_num += 1
+
+    except BrokenPipeError:
+        success = False
+    finally:
+        try:
+            encode_proc.stdin.close()
+        except Exception:
+            pass
+        decode_proc.wait()
+        _, enc_err = encode_proc.communicate()
+        stderr = enc_err.decode("utf-8", errors="replace")
+        if encode_proc.returncode != 0:
+            success = False
+        try:
+            os.unlink(tmp_audio.name)
+        except Exception:
+            pass
+
+    return success, stderr
 
 
 # ── Batch processing ──────────────────────────────────────────────────────────
@@ -276,13 +358,13 @@ def process_folder(
     Process all video files found in input_dir.
 
     Args:
-        input_dir       : Path to folder containing source videos.
-        output_dir      : Path to folder for timestamped output videos.
-        timezone_label  : Key from TIMEZONE_LABELS selected by the user.
-        text_style_label: Key from TEXT_STYLE_LABELS selected by the user.
+        input_dir       : Source folder containing videos.
+        output_dir      : Destination folder for timestamped videos.
+        timezone_label  : Key from TIMEZONE_LABELS selected in the GUI.
+        text_style_label: Key from TEXT_STYLE_LABELS selected in the GUI.
         on_progress     : Optional callback(current, total, filename).
         on_result       : Optional callback(filename, device, success, message).
-        log_dir         : Optional path to write a session log file.
+        log_dir         : Optional path for session log file.
     """
     input_dir  = Path(input_dir)
     output_dir = Path(output_dir)
@@ -290,7 +372,6 @@ def process_folder(
 
     tz_info   = TIMEZONE_BY_LABEL[timezone_label]
     tz_offset = tz_info["offset"]
-    posix_tz  = tz_info["posix_tz"]
 
     # ── Session log ───────────────────────────────────────────────────────────
     logger = None
@@ -298,11 +379,11 @@ def process_folder(
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
         log_file = log_path / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
+        handler  = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
         logger = logging.getLogger(f"vts.{log_file.stem}")
         logger.setLevel(logging.INFO)
-        logger.addHandler(file_handler)
+        logger.addHandler(handler)
         logger.propagate = False
 
     # ── File discovery ────────────────────────────────────────────────────────
@@ -315,8 +396,9 @@ def process_folder(
     if logger:
         logger.info(
             f"Session start — {total} file(s) | "
-            f"Timezone: {tz_info['abbreviation']} ({posix_tz}) | "
-            f"Style: {text_style_label}"
+            f"Timezone: {tz_info['abbreviation']} | "
+            f"Style: {text_style_label} | "
+            f"Pillow: {PILLOW_AVAILABLE}"
         )
 
     # ── Per-file loop ─────────────────────────────────────────────────────────
@@ -339,7 +421,7 @@ def process_folder(
         output_path = output_dir / filepath.name
 
         success, stderr = process_video(
-            filepath, output_path, unix_ts, text_style_label, posix_tz
+            filepath, output_path, unix_ts, text_style_label, tz_offset
         )
 
         if success:
@@ -347,9 +429,8 @@ def process_folder(
             if logger:
                 logger.info(f"OK    {filepath.name}  [{DEVICE_LABELS[device]}]  → {output_path}")
         else:
-            msg = "FFmpeg error — check session log"
+            msg = "Processing error — check session log"
             if logger:
-                # Keep only the last 800 chars of stderr to avoid huge logs
                 logger.error(
                     f"FAIL  {filepath.name}  [{DEVICE_LABELS[device]}]\n"
                     f"{stderr[-800:].strip()}"
@@ -358,7 +439,6 @@ def process_folder(
         if on_result:
             on_result(filepath.name, device, success, msg)
 
-    # ── Done ──────────────────────────────────────────────────────────────────
     if on_progress:
         on_progress(total, total, "")
 
