@@ -126,10 +126,54 @@ def detect_device(filepath):
 
 # ── Metadata extraction ───────────────────────────────────────────────────────
 
-def get_creation_time(filepath):
+import re as _re
+
+def _parse_iso_with_offset(s):
+    """
+    Parse an ISO datetime string that may have a timezone offset without a colon,
+    e.g. '2026-03-26T07:59:15+1000' or '2026-03-26T07:59:15+10:00'.
+    Returns a timezone-aware datetime or None.
+    """
+    m = _re.match(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-])(\d{2}):?(\d{2})', s.strip())
+    if not m:
+        return None
+    dt_str, sign, hh, mm_ = m.groups()
+    dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+    offset = timedelta(hours=int(hh), minutes=int(mm_))
+    if sign == "-":
+        offset = -offset
+    return dt.replace(tzinfo=timezone(offset))
+
+
+def get_apple_recording_time(filepath):
+    """
+    Read the com.apple.quicktime.creationdate tag from a QuickTime MOV file.
+
+    iPhones write the actual recording time here as a timezone-aware ISO string
+    (e.g. '2026-03-26T07:59:15+1000'). This is more reliable than mvhd because
+    the mvhd creation time is updated whenever the file is transferred or copied.
+
+    Returns a timezone-aware datetime or None if the tag is absent.
+    """
+    with open(filepath, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        m = _re.search(
+            rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2})', mm)
+        result = None
+        if m:
+            result = _parse_iso_with_offset(m.group(1).decode("ascii", errors="replace"))
+        mm.close()
+    return result
+
+
+def get_mvhd_time(filepath):
     """
     Extract creation_time from the mvhd atom.
-    Returns a UTC-aware datetime, or None if missing/zero.
+
+    Returns a NAIVE datetime (no tzinfo). The caller is responsible for
+    timezone interpretation — Apple mvhd is UTC, Sony/Unknown is local time.
+    Returns None if the atom is missing or the timestamp is zero.
     """
     with open(filepath, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -145,18 +189,45 @@ def get_creation_time(filepath):
         mm.close()
     if ts == 0:
         return None
-    return MAC_EPOCH + timedelta(seconds=ts)
+    # Strip tzinfo — return naive so the caller can attach the correct timezone
+    return (MAC_EPOCH + timedelta(seconds=ts)).replace(tzinfo=None)
+
+
+def get_creation_time(filepath, device_type):
+    """
+    Return the best available creation time for the given device type.
+
+    Apple  → com.apple.quicktime.creationdate tag (timezone-aware, actual recording time).
+             Falls back to mvhd with UTC attached if the tag is absent.
+    Sony / Unknown → mvhd as a naive datetime (caller attaches the selected timezone).
+
+    Returns (datetime, source_label) or (None, None).
+    """
+    if device_type == "apple":
+        dt = get_apple_recording_time(filepath)
+        if dt is not None:
+            return dt, "Apple creationdate tag"
+        # mvhd fallback — Apple mvhd is UTC, so attach UTC tzinfo explicitly
+        dt = get_mvhd_time(filepath)
+        if dt is not None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt, "mvhd (UTC fallback)"
+    else:
+        # Sony/Unknown — mvhd stores local time; return naive so tz is attached later
+        dt = get_mvhd_time(filepath)
+        return dt, "mvhd (local time)"
 
 
 # ── Timezone resolution ───────────────────────────────────────────────────────
 
 def resolve_unix_timestamp(creation_time, device_type, tz_offset):
     """
-    Convert mvhd datetime to a UTC Unix timestamp.
-    Apple: mvhd is UTC — use directly.
-    Sony/Unknown: mvhd is local time — attach selected tz, convert to UTC.
+    Convert the creation datetime to a UTC Unix timestamp for display.
+
+    Timezone-aware datetime (Apple) → use .timestamp() directly.
+    Naive datetime (Sony/Unknown)   → attach user-selected timezone first.
     """
-    if device_type == "apple":
+    if creation_time.tzinfo is not None:
         return int(creation_time.timestamp())
     else:
         local_dt = creation_time.replace(tzinfo=timezone(tz_offset))
@@ -406,8 +477,8 @@ def process_folder(
         if on_progress:
             on_progress(i, total, filepath.name)
 
-        device        = detect_device(filepath)
-        creation_time = get_creation_time(filepath)
+        device                    = detect_device(filepath)
+        creation_time, ts_source  = get_creation_time(filepath, device)
 
         if creation_time is None:
             msg = "No metadata timestamp — skipped"
@@ -417,7 +488,13 @@ def process_folder(
                 logger.warning(f"SKIP  {filepath.name}  [{DEVICE_LABELS[device]}]  — {msg}")
             continue
 
-        unix_ts     = resolve_unix_timestamp(creation_time, device, tz_offset)
+        unix_ts = resolve_unix_timestamp(creation_time, device, tz_offset)
+        if logger:
+            local_display = format_timestamp(unix_ts, tz_offset)
+            logger.info(
+                f"TS    {filepath.name}  [{DEVICE_LABELS[device]}]  "
+                f"source={ts_source}  display={local_display}"
+            )
         output_path = output_dir / filepath.name
 
         success, stderr = process_video(
