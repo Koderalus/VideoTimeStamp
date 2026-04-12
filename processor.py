@@ -213,9 +213,12 @@ def get_creation_time(filepath, device_type):
             dt = dt.replace(tzinfo=timezone.utc)
         return dt, "mvhd (UTC fallback)"
     else:
-        # Sony/Unknown — mvhd stores local time; return naive so tz is attached later
+        # Sony MSNV (Action Cam / Handycam) stores UTC in mvhd — attach UTC so it
+        # is correctly converted to the user-selected timezone for display.
         dt = get_mvhd_time(filepath)
-        return dt, "mvhd (local time)"
+        if dt is not None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt, "mvhd (UTC)"
 
 
 # ── Timezone resolution ───────────────────────────────────────────────────────
