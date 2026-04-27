@@ -373,7 +373,10 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     # 270 = iPhone landscape (-90 normalised): rotate 90° CW → transpose=1
     # 90: rotate 90° CCW → transpose=2
     # 180: flip both axes
-    decode_cmd = ["ffmpeg", "-i", str(input_path)]
+    # Disable ffmpeg's implicit auto-rotation so we apply rotation exactly once
+    # via the explicit filters below. Without this, iPhone clips with a display
+    # matrix can be rotated twice and produce corrupted-looking frames.
+    decode_cmd = ["ffmpeg", "-noautorotate", "-i", str(input_path)]
     if rotation == 270:
         decode_cmd += ["-vf", "transpose=1"]
     elif rotation == 90:
