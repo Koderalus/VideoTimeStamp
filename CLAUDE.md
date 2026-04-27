@@ -60,6 +60,10 @@ Text styles live in the `TEXT_STYLES` list. The style name string is matched in 
 
 ## Known edge cases
 
-**iOS Photos app edited videos**: When a user edits (crops, reorients, trims) an iPhone video in the Photos app and exports it, the resulting H.264 file contains a garbage SPS VUI clock (`time_scale = 16,777,216`, `num_units_in_tick = 6`), which makes ffprobe report `r_frame_rate ≈ 1,398,101 fps`. Using that value would produce a 0.67 ms output video (effectively invisible). Fixed in `_parse_fps()` by preferring `avg_frame_rate` (always container-derived, always correct) and validating the result is within 1–300 fps.
+**Video rotation (iPhone landscape recordings)**: iPhones store landscape video as portrait pixel data with a 90° rotation flag in the `tkhd` Display Matrix. The old pipeline ignored this flag, so the output video was sideways. Fixed: `_get_rotation()` reads the rotation from ffprobe's `side_data_list`, `get_video_info()` swaps width/height for 90°/270° rotations, and `process_video()` applies the matching `transpose` filter to the decode step. ffprobe rotation -90° normalises to 270 → `transpose=1` (90° CW).
 
-Photos-edited videos are also re-encoded as H.264 profile 244 (High 4:4:4 Predictive) instead of the usual High profile, and the H.264 SPS frame_crop dimensions (1228×1636 in tested sample) may differ slightly from the container's tkhd dimensions (1238×1650). The output video will be at the SPS display size; this is expected.
+**H.264 High 4:4:4 Predictive (profile 244)**: When libx264 receives `rgb24` raw frames without an output `-pix_fmt`, it defaults to profile 244 instead of the standard High profile. Profile 244 is not supported by most hardware decoders. Fixed by adding `-pix_fmt yuv420p` to the encode command.
+
+**Videos with no embedded timestamp**: If a video's `mvhd` creation_time is zero AND the `com.apple.quicktime.creationdate` tag is absent (e.g. a file re-encoded by FFmpeg), the file is skipped with a "No metadata timestamp" warning. This cannot be fixed automatically — the user must process the original source file which has the intact recording time.
+
+**Defensive fps parsing**: `_parse_fps()` prefers `avg_frame_rate` over `r_frame_rate`. For H.264, `r_frame_rate` is sourced from the SPS VUI timing fields; some encoders write garbage values (e.g. `time_scale=16777216, num_units_in_tick=6` → ~1.4 M fps). `avg_frame_rate` is always container-derived and reliable.
