@@ -265,6 +265,32 @@ def format_timestamp(unix_ts, tz_offset):
 
 # ── Video info ────────────────────────────────────────────────────────────────
 
+def _parse_fps(stream):
+    """
+    Resolve playback fps from a ffprobe stream dict.
+
+    avg_frame_rate is preferred because r_frame_rate for H.264 is sourced
+    from the SPS VUI timing fields when present.  The iOS Photos app exports
+    edited H.264 videos with VUI time_scale=16777216 and num_units_in_tick=6,
+    yielding r_frame_rate ≈ 1,398,101 fps.  avg_frame_rate is always derived
+    from the container's stts table and is correct.
+    """
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        raw = stream.get(key, "0/0")
+        parts = raw.split("/")
+        if len(parts) != 2:
+            continue
+        try:
+            num, den = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if den > 0:
+            fps = num / den
+            if 1.0 <= fps <= 300.0:
+                return fps
+    return 25.0
+
+
 def get_video_info(filepath):
     """Return width, height, and fps of the first video stream via ffprobe."""
     cmd = [
@@ -279,8 +305,7 @@ def get_video_info(filepath):
         if stream.get("codec_type") == "video":
             width = int(stream["width"])
             height = int(stream["height"])
-            num, den = map(int, stream.get("r_frame_rate", "25/1").split("/"))
-            fps = num / den
+            fps   = _parse_fps(stream)
             return {"width": width, "height": height, "fps": fps}
     raise ValueError(f"No video stream found in {filepath}")
 
