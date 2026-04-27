@@ -269,11 +269,10 @@ def _parse_fps(stream):
     """
     Resolve playback fps from a ffprobe stream dict.
 
-    avg_frame_rate is preferred because r_frame_rate for H.264 is sourced
-    from the SPS VUI timing fields when present.  The iOS Photos app exports
-    edited H.264 videos with VUI time_scale=16777216 and num_units_in_tick=6,
-    yielding r_frame_rate ≈ 1,398,101 fps.  avg_frame_rate is always derived
-    from the container's stts table and is correct.
+    avg_frame_rate is preferred over r_frame_rate as a defensive measure:
+    some H.264 encoders write garbage SPS VUI timing values that can make
+    r_frame_rate report millions of fps.  avg_frame_rate is derived from the
+    container's stts table and is always reliable.
     """
     for key in ("avg_frame_rate", "r_frame_rate"):
         raw = stream.get(key, "0/0")
@@ -291,8 +290,22 @@ def _parse_fps(stream):
     return 25.0
 
 
+def _get_rotation(stream):
+    """
+    Return the display rotation (0, 90, 180, or 270) from the stream's Display Matrix.
+
+    ffprobe returns the degrees CCW to rotate the frame for correct display.
+    -90 (iPhone landscape) normalises to 270.
+    """
+    for sd in stream.get("side_data_list", []):
+        if sd.get("side_data_type") == "Display Matrix":
+            rot = sd.get("rotation", 0)
+            return int(round(rot)) % 360
+    return 0
+
+
 def get_video_info(filepath):
-    """Return width, height, and fps of the first video stream via ffprobe."""
+    """Return width, height, fps, and rotation of the first video stream via ffprobe."""
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
@@ -303,10 +316,15 @@ def get_video_info(filepath):
     data = json.loads(result.stdout)
     for stream in data.get("streams", []):
         if stream.get("codec_type") == "video":
-            width = int(stream["width"])
-            height = int(stream["height"])
-            fps   = _parse_fps(stream)
-            return {"width": width, "height": height, "fps": fps}
+            width    = int(stream["width"])
+            height   = int(stream["height"])
+            fps      = _parse_fps(stream)
+            rotation = _get_rotation(stream)
+            # ffprobe reports stored dimensions; swap for 90°/270° so callers
+            # always receive the correct display (output) dimensions.
+            if rotation in (90, 270):
+                width, height = height, width
+            return {"width": width, "height": height, "fps": fps, "rotation": rotation}
     raise ValueError(f"No video stream found in {filepath}")
 
 
@@ -326,6 +344,7 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
 
     info = get_video_info(input_path)
     width, height, fps = info["width"], info["height"], info["fps"]
+    rotation  = info.get("rotation", 0)
     frame_size = width * height * 3  # RGB24 bytes per frame
 
     # ── Font and scale-aware measurements ────────────────────────────────────
@@ -349,13 +368,24 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     has_audio = audio_result.returncode == 0 and os.path.getsize(tmp_audio.name) > 0
 
     # ── Decode process (video frames → stdout) ────────────────────────────────
-    decode_cmd = [
-        "ffmpeg", "-i", str(input_path),
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-an",
-        "pipe:1",
-    ]
+    # Apply rotation from the Display Matrix so the output is correctly oriented.
+    # ffprobe rotation = degrees CCW to rotate for correct display.
+    # 270 = iPhone landscape (-90 normalised): rotate 90° CW → transpose=1
+    # 90: rotate 90° CCW → transpose=2
+    # 180: flip both axes
+    decode_cmd = ["ffmpeg", "-i", str(input_path)]
+    if rotation == 270:
+        decode_cmd += ["-vf", "transpose=1"]
+    elif rotation == 90:
+        decode_cmd += ["-vf", "transpose=2"]
+    elif rotation == 180:
+        decode_cmd += ["-vf", "hflip,vflip"]
+    decode_cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1"]
 
     # ── Encode process (stdin → output file) ──────────────────────────────────
+    # -pix_fmt yuv420p forces standard H.264 High profile.  Without it, libx264
+    # receives rgb24 and defaults to High 4:4:4 Predictive (profile 244), which
+    # is incompatible with most hardware decoders.
     encode_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -365,7 +395,7 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     ]
     if has_audio:
         encode_cmd += ["-i", tmp_audio.name]
-    encode_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
+    encode_cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p"]
     if has_audio:
         encode_cmd += ["-c:a", "copy"]
     encode_cmd += [str(output_path)]
