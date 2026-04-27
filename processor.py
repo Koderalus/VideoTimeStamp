@@ -83,6 +83,10 @@ DEVICE_LABELS = {
     "unknown": "Unknown",
 }
 
+OUTPUT_MODE_VIDEO = "Video (timestamped)"
+OUTPUT_MODE_STILL = "Still image (timestamped)"
+OUTPUT_MODE_LABELS = [OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL]
+
 
 # ── FFmpeg / Pillow checks ────────────────────────────────────────────────────
 
@@ -263,6 +267,65 @@ def format_timestamp(unix_ts, tz_offset):
     return dt.strftime("%d/%m/%Y %I:%M:%S %p")
 
 
+def _rotation_filter(rotation):
+    """Map display rotation to an ffmpeg video filter string."""
+    if rotation == 270:
+        return "transpose=1"  # 90° CW
+    if rotation == 90:
+        return "transpose=2"  # 90° CCW
+    if rotation == 180:
+        return "hflip,vflip"
+    return None
+
+
+def _build_text_style(width, height):
+    """Resolve font and scale-aware drawing parameters for a frame/image size."""
+    font_path    = find_system_font()
+    font_size    = max(20, height // 28)
+    edge_padding = max(20, width  // 60)
+    outline_w    = max(2,  font_size // 10)
+    try:
+        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    return font, font_size, edge_padding, outline_w
+
+
+def _draw_timestamp(img, ts_text, text_style_label, font, font_size, edge_padding, outline_w):
+    """Draw timestamp text onto an RGB Pillow image and return the modified image."""
+    draw = ImageDraw.Draw(img)
+
+    bbox   = draw.textbbox((0, 0), ts_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = img.width  - text_w - edge_padding
+    y = img.height - text_h - edge_padding
+
+    if text_style_label == "White text only":
+        draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+    elif text_style_label == "White text with black outline":
+        ow = outline_w
+        for ox, oy in [(-ow, 0), (ow, 0), (0, -ow), (0, ow),
+                       (-ow, -ow), (ow, -ow), (-ow, ow), (ow, ow)]:
+            draw.text((x + ox, y + oy), ts_text, font=font, fill=(0, 0, 0))
+        draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+    elif text_style_label == "White text with background box":
+        box_pad = max(6, font_size // 8)
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ov_draw = ImageDraw.Draw(overlay)
+        ov_draw.rectangle(
+            [x - box_pad, y - box_pad, x + text_w + box_pad, y + text_h + box_pad],
+            fill=(0, 0, 0, 128),
+        )
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+
+    return img
+
+
 # ── Video info ────────────────────────────────────────────────────────────────
 
 def _parse_fps(stream):
@@ -348,14 +411,7 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     frame_size = width * height * 3  # RGB24 bytes per frame
 
     # ── Font and scale-aware measurements ────────────────────────────────────
-    font_path    = find_system_font()
-    font_size    = max(20, height // 28)
-    edge_padding = max(20, width  // 60)   # distance from frame edge (scales with resolution)
-    outline_w    = max(2,  font_size // 10) # outline thickness scales with font size
-    try:
-        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
+    font, font_size, edge_padding, outline_w = _build_text_style(width, height)
 
     # ── Extract audio to a temp file ──────────────────────────────────────────
     tmp_audio = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
@@ -370,19 +426,14 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     # ── Decode process (video frames → stdout) ────────────────────────────────
     # Apply rotation from the Display Matrix so the output is correctly oriented.
     # ffprobe rotation = degrees CCW to rotate for correct display.
-    # 270 = iPhone landscape (-90 normalised): rotate 90° CW → transpose=1
-    # 90: rotate 90° CCW → transpose=2
-    # 180: flip both axes
+    # 270 = iPhone landscape (-90 normalised): rotate 90° CW.
     # Disable ffmpeg's implicit auto-rotation so we apply rotation exactly once
     # via the explicit filters below. Without this, iPhone clips with a display
     # matrix can be rotated twice and produce corrupted-looking frames.
     decode_cmd = ["ffmpeg", "-noautorotate", "-i", str(input_path)]
-    if rotation == 270:
-        decode_cmd += ["-vf", "transpose=1"]
-    elif rotation == 90:
-        decode_cmd += ["-vf", "transpose=2"]
-    elif rotation == 180:
-        decode_cmd += ["-vf", "hflip,vflip"]
+    rot_filter = _rotation_filter(rotation)
+    if rot_filter:
+        decode_cmd += ["-vf", rot_filter]
     decode_cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1"]
 
     # ── Encode process (stdin → output file) ──────────────────────────────────
@@ -421,40 +472,10 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
             frame_unix_ts = unix_ts + (frame_num / fps)
             ts_text = format_timestamp(frame_unix_ts, tz_offset)
 
-            img  = Image.frombytes("RGB", (width, height), raw)
-            draw = ImageDraw.Draw(img)
-
-            # Measure text dimensions and position (bottom-right with scaled padding)
-            bbox   = draw.textbbox((0, 0), ts_text, font=font)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            x = width  - text_w - edge_padding
-            y = height - text_h - edge_padding
-
-            style_name = text_style_label
-
-            if style_name == "White text only":
-                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
-
-            elif style_name == "White text with black outline":
-                ow = outline_w
-                for ox, oy in [(-ow, 0), (ow, 0), (0, -ow), (0, ow),
-                                (-ow, -ow), (ow, -ow), (-ow, ow), (ow, ow)]:
-                    draw.text((x + ox, y + oy), ts_text, font=font, fill=(0, 0, 0))
-                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
-
-            elif style_name == "White text with background box":
-                box_pad = max(6, font_size // 8)
-                overlay    = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                ov_draw    = ImageDraw.Draw(overlay)
-                ov_draw.rectangle(
-                    [x - box_pad, y - box_pad,
-                     x + text_w + box_pad, y + text_h + box_pad],
-                    fill=(0, 0, 0, 128),
-                )
-                img  = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-                draw = ImageDraw.Draw(img)
-                draw.text((x, y), ts_text, font=font, fill=(255, 255, 255))
+            img = Image.frombytes("RGB", (width, height), raw)
+            img = _draw_timestamp(
+                img, ts_text, text_style_label, font, font_size, edge_padding, outline_w
+            )
 
             encode_proc.stdin.write(img.tobytes())
             frame_num += 1
@@ -479,6 +500,52 @@ def process_video(input_path, output_path, unix_ts, text_style_label, tz_offset)
     return success, stderr
 
 
+def process_still(input_path, output_path, unix_ts, text_style_label, tz_offset, still_time_seconds):
+    """
+    Extract one frame from input_path, burn the timestamp, and save as JPG.
+
+    Returns: (success: bool, stderr: str)
+    """
+    if not PILLOW_AVAILABLE:
+        return False, "Pillow is not installed. Run: bash install.sh"
+
+    info = get_video_info(input_path)
+    width, height = info["width"], info["height"]
+    rotation = info.get("rotation", 0)
+    frame_size = width * height * 3
+    still_time_seconds = max(0.0, float(still_time_seconds))
+
+    decode_cmd = [
+        "ffmpeg", "-v", "error",
+        "-noautorotate",
+        "-ss", f"{still_time_seconds:.3f}",
+        "-i", str(input_path),
+    ]
+    rot_filter = _rotation_filter(rotation)
+    if rot_filter:
+        decode_cmd += ["-vf", rot_filter]
+    decode_cmd += ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1"]
+
+    result = subprocess.run(decode_cmd, capture_output=True)
+    if result.returncode != 0:
+        return False, result.stderr.decode("utf-8", errors="replace")
+    if len(result.stdout) < frame_size:
+        return False, f"No frame decoded at {still_time_seconds:.3f}s"
+
+    img = Image.frombytes("RGB", (width, height), result.stdout[:frame_size])
+    ts_text = format_timestamp(unix_ts + still_time_seconds, tz_offset)
+    font, font_size, edge_padding, outline_w = _build_text_style(width, height)
+    img = _draw_timestamp(img, ts_text, text_style_label, font, font_size, edge_padding, outline_w)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        img.save(output_path, format="JPEG", quality=95)
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
+
+
 # ── Batch processing ──────────────────────────────────────────────────────────
 
 def process_folder(
@@ -486,6 +553,8 @@ def process_folder(
     output_dir,
     timezone_label,
     text_style_label,
+    output_mode_label=OUTPUT_MODE_VIDEO,
+    still_time_seconds=0.0,
     on_progress=None,
     on_result=None,
     log_dir=None,
@@ -498,6 +567,8 @@ def process_folder(
         output_dir      : Destination folder for timestamped videos.
         timezone_label  : Key from TIMEZONE_LABELS selected in the GUI.
         text_style_label: Key from TEXT_STYLE_LABELS selected in the GUI.
+        output_mode_label: OUTPUT_MODE_VIDEO or OUTPUT_MODE_STILL.
+        still_time_seconds: Frame time used in still mode.
         on_progress     : Optional callback(current, total, filename).
         on_result       : Optional callback(filename, device, success, message).
         log_dir         : Optional path for session log file.
@@ -508,6 +579,7 @@ def process_folder(
 
     tz_info   = TIMEZONE_BY_LABEL[timezone_label]
     tz_offset = tz_info["offset"]
+    still_mode = (output_mode_label == OUTPUT_MODE_STILL)
 
     # ── Session log ───────────────────────────────────────────────────────────
     logger = None
@@ -534,6 +606,8 @@ def process_folder(
             f"Session start — {total} file(s) | "
             f"Timezone: {tz_info['abbreviation']} | "
             f"Style: {text_style_label} | "
+            f"Mode: {output_mode_label} | "
+            f"Still time: {still_time_seconds:.3f}s | "
             f"Pillow: {PILLOW_AVAILABLE}"
         )
 
@@ -560,11 +634,21 @@ def process_folder(
                 f"TS    {filepath.name}  [{DEVICE_LABELS[device]}]  "
                 f"source={ts_source}  display={local_display}"
             )
-        output_path = output_dir / filepath.name
-
-        success, stderr = process_video(
-            filepath, output_path, unix_ts, text_style_label, tz_offset
-        )
+        if still_mode:
+            output_path = output_dir / f"{filepath.stem}_still.jpg"
+            success, stderr = process_still(
+                filepath,
+                output_path,
+                unix_ts,
+                text_style_label,
+                tz_offset,
+                still_time_seconds,
+            )
+        else:
+            output_path = output_dir / filepath.name
+            success, stderr = process_video(
+                filepath, output_path, unix_ts, text_style_label, tz_offset
+            )
 
         if success:
             msg = str(output_path)
