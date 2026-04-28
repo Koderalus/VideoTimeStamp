@@ -10,6 +10,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import json
 import queue
+import re
 from pathlib import Path
 
 import processor
@@ -25,6 +26,8 @@ LOG_DIR     = BASE_DIR / "logs"
 DEFAULT_CONFIG = {
     "timezone":      processor.TIMEZONE_LABELS[0],
     "text_style":    processor.TEXT_STYLE_LABELS[0],
+    "output_mode":   processor.OUTPUT_MODE_VIDEO,
+    "still_time":    "00:00:00",
     "input_folder":  "",
     "output_folder": "",
 }
@@ -41,6 +44,7 @@ class App(tk.Tk):
 
         self._config = self._load_config()
         self._queue  = queue.Queue()
+        self._ffmpeg_available = True
 
         self._build_ui()
         self._check_ffmpeg()
@@ -63,6 +67,8 @@ class App(tk.Tk):
         data = {
             "timezone":      self._tz_var.get(),
             "text_style":    self._style_var.get(),
+            "output_mode":   self._mode_var.get(),
+            "still_time":    self._still_time_var.get(),
             "input_folder":  self._input_var.get(),
             "output_folder": self._output_var.get(),
         }
@@ -77,14 +83,16 @@ class App(tk.Tk):
     # ── FFmpeg check ──────────────────────────────────────────────────────────
 
     def _check_ffmpeg(self):
-        if not processor.check_ffmpeg():
+        self._ffmpeg_available = processor.check_ffmpeg()
+        if not self._ffmpeg_available:
             messagebox.showerror(
                 "FFmpeg not found",
-                "FFmpeg is required but was not found on your PATH.\n\n"
+                "FFmpeg is required for video processing but was not found on your PATH.\n\n"
                 "Run the setup script to install it:\n"
-                "    bash install.sh",
+                "    bash install.sh\n\n"
+                "Screenshot image mode can still run without FFmpeg.",
             )
-            self._process_btn.configure(state="disabled")
+            self._on_mode_change()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -133,7 +141,7 @@ class App(tk.Tk):
             row=4, column=0, **PAD, sticky="w")
         self._style_var = tk.StringVar(value=self._config["text_style"])
         style_row = tk.Frame(self)
-        style_row.grid(row=4, column=1, **PAD, sticky="w")
+        style_row.grid(row=4, column=1, **PAD, sticky="ew")
         ttk.Combobox(
             style_row,
             textvariable=self._style_var,
@@ -146,9 +154,32 @@ class App(tk.Tk):
             command=self._save_defaults,
         ).pack(side="left", padx=(10, 0))
 
+        # ── Output mode + still time ──────────────────────────────────────────
+        tk.Label(self, text="Output mode:", anchor="w", width=LABEL_W).grid(
+            row=5, column=0, **PAD, sticky="w")
+        mode_row = tk.Frame(self)
+        mode_row.grid(row=5, column=1, **PAD, sticky="ew")
+
+        self._mode_var = tk.StringVar(
+            value=self._config.get("output_mode", processor.OUTPUT_MODE_VIDEO))
+        mode_box = ttk.Combobox(
+            mode_row,
+            textvariable=self._mode_var,
+            values=processor.OUTPUT_MODE_LABELS,
+            width=30,
+            state="readonly",
+        )
+        mode_box.pack(side="left")
+        mode_box.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        tk.Label(mode_row, text="Still time (HH:MM:SS):").pack(side="left", padx=(12, 4))
+        self._still_time_var = tk.StringVar(value=self._config.get("still_time", "00:00:00"))
+        self._still_time_entry = tk.Entry(mode_row, textvariable=self._still_time_var, width=12)
+        self._still_time_entry.pack(side="left")
+
         # ── Separator ─────────────────────────────────────────────────────────
         ttk.Separator(self, orient="horizontal").grid(
-            row=5, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
+            row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
 
         # ── Process button ────────────────────────────────────────────────────
         self._process_btn = tk.Button(
@@ -163,21 +194,21 @@ class App(tk.Tk):
             activebackground="#155aa0",
             activeforeground="white",
         )
-        self._process_btn.grid(row=6, column=0, columnspan=3, pady=(0, 10))
+        self._process_btn.grid(row=7, column=0, columnspan=3, pady=(0, 10))
 
         # ── Progress ──────────────────────────────────────────────────────────
         self._progress_label = tk.Label(self, text="", font=("Helvetica", 10))
-        self._progress_label.grid(row=7, column=0, columnspan=3)
+        self._progress_label.grid(row=8, column=0, columnspan=3)
 
         self._progress_bar = ttk.Progressbar(
             self, length=550, mode="determinate")
         self._progress_bar.grid(
-            row=8, column=0, columnspan=3, padx=12, pady=(2, 8))
+            row=9, column=0, columnspan=3, padx=12, pady=(2, 8))
 
         # ── Log area ──────────────────────────────────────────────────────────
         log_frame = tk.Frame(self, bd=1, relief="sunken")
         log_frame.grid(
-            row=9, column=0, columnspan=3,
+            row=10, column=0, columnspan=3,
             padx=12, pady=(0, 14), sticky="ew")
 
         self._log = tk.Text(
@@ -199,6 +230,8 @@ class App(tk.Tk):
         self._log.tag_config("warn", foreground="#e5a100")   # amber  — skipped / error
         self._log.tag_config("info", foreground="#9cdcfe")   # blue   — status lines
 
+        self._on_mode_change()
+
     # ── Folder browsers ───────────────────────────────────────────────────────
 
     def _browse_input(self):
@@ -210,6 +243,41 @@ class App(tk.Tk):
         folder = filedialog.askdirectory(title="Select output folder")
         if folder:
             self._output_var.set(folder)
+
+    # ── Output mode helpers ───────────────────────────────────────────────────
+
+    def _on_mode_change(self, _event=None):
+        mode = self._mode_var.get()
+        state = "normal" if mode == processor.OUTPUT_MODE_STILL else "disabled"
+        self._still_time_entry.configure(state=state)
+
+        if mode == processor.OUTPUT_MODE_STILL:
+            self._process_btn.configure(text="Extract Stills")
+        elif mode == processor.OUTPUT_MODE_SCREENSHOT:
+            self._process_btn.configure(text="Process Screenshots")
+        else:
+            self._process_btn.configure(text="Process Videos")
+
+        if (
+            not self._ffmpeg_available
+            and mode in (processor.OUTPUT_MODE_VIDEO, processor.OUTPUT_MODE_STILL)
+        ):
+            self._process_btn.configure(state="disabled")
+        else:
+            self._process_btn.configure(state="normal")
+
+    def _parse_still_time_to_seconds(self, raw):
+        text = raw.strip()
+        if not re.fullmatch(r"\d{1,2}:\d{2}:\d{2}(?:\.\d+)?", text):
+            raise ValueError
+
+        hh, mm, ss = text.split(":")
+        hours = int(hh)
+        minutes = int(mm)
+        seconds = float(ss)
+        if minutes >= 60 or seconds >= 60:
+            raise ValueError
+        return (hours * 3600) + (minutes * 60) + seconds
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -252,7 +320,7 @@ class App(tk.Tk):
                             "warn")
 
                 elif kind == "done":
-                    self._process_btn.configure(state="normal")
+                    self._on_mode_change()
 
         except queue.Empty:
             pass
@@ -264,6 +332,7 @@ class App(tk.Tk):
     def _start_processing(self):
         input_dir  = self._input_var.get().strip()
         output_dir = self._output_var.get().strip()
+        output_mode = self._mode_var.get()
 
         if not input_dir or not output_dir:
             messagebox.showerror(
@@ -277,6 +346,17 @@ class App(tk.Tk):
                 f"Input folder does not exist:\n{input_dir}")
             return
 
+        still_time_seconds = 0.0
+        if output_mode == processor.OUTPUT_MODE_STILL:
+            try:
+                still_time_seconds = self._parse_still_time_to_seconds(
+                    self._still_time_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid still time",
+                    "Use HH:MM:SS (or HH:MM:SS.sss), for example 00:00:03")
+                return
+
         # Reset UI
         self._log.configure(state="normal")
         self._log.delete("1.0", "end")
@@ -286,17 +366,20 @@ class App(tk.Tk):
         self._process_btn.configure(state="disabled")
 
         tz_short = self._tz_var.get().split("\u2014")[0].strip()
+        mode_text = output_mode
+        if output_mode == processor.OUTPUT_MODE_STILL:
+            mode_text += f" @ {self._still_time_var.get().strip()}"
         self._log_line(
-            f"  Starting  |  Timezone: {tz_short}  |  Style: {self._style_var.get()}",
+            f"  Starting  |  Timezone: {tz_short}  |  Style: {self._style_var.get()}  |  Mode: {mode_text}",
             "info")
 
         threading.Thread(
             target=self._run_processing,
-            args=(input_dir, output_dir),
+            args=(input_dir, output_dir, output_mode, still_time_seconds),
             daemon=True,
         ).start()
 
-    def _run_processing(self, input_dir, output_dir):
+    def _run_processing(self, input_dir, output_dir, output_mode, still_time_seconds):
         def on_progress(current, total, filename):
             self._queue.put(("progress", current, total, filename))
 
@@ -308,6 +391,8 @@ class App(tk.Tk):
             output_dir       = output_dir,
             timezone_label   = self._tz_var.get(),
             text_style_label = self._style_var.get(),
+            output_mode_label = output_mode,
+            still_time_seconds = still_time_seconds,
             on_progress      = on_progress,
             on_result        = on_result,
             log_dir          = str(LOG_DIR),
