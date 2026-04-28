@@ -266,6 +266,137 @@ def _parse_image_filename_time(filepath):
     return None
 
 
+def _read_jpeg_exif_tiff(filepath):
+    """Return TIFF bytes from a JPEG APP1 Exif segment, or None."""
+    try:
+        with open(filepath, "rb") as f:
+            if f.read(2) != b"\xff\xd8":
+                return None
+
+            while True:
+                prefix = f.read(1)
+                if not prefix:
+                    return None
+                if prefix != b"\xff":
+                    continue
+
+                marker = f.read(1)
+                while marker == b"\xff":
+                    marker = f.read(1)
+                if not marker or marker in (b"\xd9", b"\xda"):
+                    return None
+
+                length_bytes = f.read(2)
+                if len(length_bytes) != 2:
+                    return None
+                length = int.from_bytes(length_bytes, "big")
+                if length < 2:
+                    return None
+
+                payload = f.read(length - 2)
+                if marker == b"\xe1" and payload.startswith(b"Exif\x00\x00"):
+                    return payload[6:]
+    except OSError:
+        return None
+
+
+def _extract_tiff_ascii(tiff, endian, entry_offset):
+    """Read an ASCII TIFF entry value from an IFD entry offset."""
+    typ = int.from_bytes(tiff[entry_offset + 2:entry_offset + 4], endian)
+    count = int.from_bytes(tiff[entry_offset + 4:entry_offset + 8], endian)
+    value_or_offset = tiff[entry_offset + 8:entry_offset + 12]
+    if typ != 2 or count <= 0:
+        return None
+
+    if count <= 4:
+        raw = value_or_offset[:count]
+    else:
+        value_offset = int.from_bytes(value_or_offset, endian)
+        if value_offset < 0 or value_offset + count > len(tiff):
+            return None
+        raw = tiff[value_offset:value_offset + count]
+    return raw.rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+
+
+def _read_tiff_ifd_entries(tiff, endian, ifd_offset):
+    """Return a mapping of tag id to IFD entry offset for a TIFF IFD."""
+    if ifd_offset < 0 or ifd_offset + 2 > len(tiff):
+        return {}
+
+    count = int.from_bytes(tiff[ifd_offset:ifd_offset + 2], endian)
+    entries_start = ifd_offset + 2
+    entries_end = entries_start + (count * 12)
+    if entries_end > len(tiff):
+        return {}
+
+    entries = {}
+    for idx in range(count):
+        entry_offset = entries_start + (idx * 12)
+        tag = int.from_bytes(tiff[entry_offset:entry_offset + 2], endian)
+        entries[tag] = entry_offset
+    return entries
+
+
+def _extract_exif_datetime(filepath):
+    """
+    Extract EXIF creation datetime directly from JPEG metadata.
+
+    Pillow may expose only the top-level IFD for some exported stills. This
+    parser follows the nested ExifIFD pointer so DateTimeOriginal is still found
+    before the filename fallback is used.
+    """
+    tiff = _read_jpeg_exif_tiff(filepath)
+    if not tiff or len(tiff) < 8:
+        return None, None
+
+    byte_order = tiff[:2]
+    if byte_order == b"II":
+        endian = "little"
+    elif byte_order == b"MM":
+        endian = "big"
+    else:
+        return None, None
+
+    if int.from_bytes(tiff[2:4], endian) != 42:
+        return None, None
+
+    ifd0_offset = int.from_bytes(tiff[4:8], endian)
+    ifd0 = _read_tiff_ifd_entries(tiff, endian, ifd0_offset)
+    ifds = [ifd0]
+
+    exif_pointer_entry = ifd0.get(34665)
+    if exif_pointer_entry is not None:
+        exif_ifd_offset = int.from_bytes(
+            tiff[exif_pointer_entry + 8:exif_pointer_entry + 12],
+            endian,
+        )
+        exif_ifd = _read_tiff_ifd_entries(tiff, endian, exif_ifd_offset)
+        if exif_ifd:
+            ifds.insert(0, exif_ifd)
+
+    candidates = (
+        (36867, 36881, "EXIF DateTimeOriginal"),
+        (36868, 36882, "EXIF DateTimeDigitized"),
+        (306, 36880, "EXIF DateTime"),
+    )
+    for ifd in ifds:
+        for date_tag, offset_tag, source in candidates:
+            date_entry = ifd.get(date_tag)
+            if date_entry is None:
+                continue
+            offset_entry = ifd.get(offset_tag)
+            date_value = _extract_tiff_ascii(tiff, endian, date_entry)
+            offset_value = (
+                _extract_tiff_ascii(tiff, endian, offset_entry)
+                if offset_entry is not None else None
+            )
+            dt = _parse_datetime_value(date_value, offset_value)
+            if dt is not None:
+                return dt, source
+
+    return None, None
+
+
 def get_apple_recording_time(filepath):
     """
     Read the com.apple.quicktime.creationdate tag from a QuickTime MOV file.
@@ -394,6 +525,10 @@ def get_image_creation_time(filepath):
     a controlled fallback. Returned filename/EXIF datetimes are usually naive
     and are interpreted in the user-selected timezone by resolve_unix_timestamp().
     """
+    dt, source = _extract_exif_datetime(filepath)
+    if dt is not None:
+        return dt, source
+
     if PILLOW_AVAILABLE:
         try:
             with Image.open(filepath) as img:
