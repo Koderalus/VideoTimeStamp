@@ -57,6 +57,8 @@ class App(tk.Tk):
             try:
                 with open(CONFIG_FILE, encoding="utf-8") as f:
                     saved = json.load(f)
+                if saved.get("output_mode") == processor.OUTPUT_MODE_SCREENSHOT:
+                    saved["output_mode"] = processor.OUTPUT_MODE_IMAGE
                 return {**DEFAULT_CONFIG, **saved}
             except (json.JSONDecodeError, OSError):
                 pass
@@ -90,7 +92,7 @@ class App(tk.Tk):
                 "FFmpeg is required for video processing but was not found on your PATH.\n\n"
                 "Run the setup script to install it:\n"
                 "    bash install.sh\n\n"
-                "Screenshot image mode can still run without FFmpeg.",
+                "Image mode can still run without FFmpeg.",
             )
             self._on_mode_change()
 
@@ -253,8 +255,8 @@ class App(tk.Tk):
 
         if mode == processor.OUTPUT_MODE_STILL:
             self._process_btn.configure(text="Extract Stills")
-        elif mode == processor.OUTPUT_MODE_SCREENSHOT:
-            self._process_btn.configure(text="Process Screenshots")
+        elif mode == processor.OUTPUT_MODE_IMAGE:
+            self._process_btn.configure(text="Process Images")
         else:
             self._process_btn.configure(text="Process Videos")
 
