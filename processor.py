@@ -79,16 +79,17 @@ TEXT_STYLE_LABELS   = [s["label"] for s in TEXT_STYLES]
 TEXT_STYLE_BY_LABEL = {s["label"]: s for s in TEXT_STYLES}
 
 DEVICE_LABELS = {
-    "apple":      "Apple",
-    "sony":       "Sony",
-    "screenshot": "Screenshot",
-    "unknown":    "Unknown",
+    "apple":   "Apple",
+    "sony":    "Sony",
+    "image":   "Image",
+    "unknown": "Unknown",
 }
 
 OUTPUT_MODE_VIDEO = "Video (timestamped)"
 OUTPUT_MODE_STILL = "Still image (timestamped)"
+OUTPUT_MODE_IMAGE = "Image (timestamped)"
 OUTPUT_MODE_SCREENSHOT = "Screenshot image (timestamped)"
-OUTPUT_MODE_LABELS = [OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, OUTPUT_MODE_SCREENSHOT]
+OUTPUT_MODE_LABELS = [OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, OUTPUT_MODE_IMAGE]
 
 
 # ── FFmpeg / Pillow checks ────────────────────────────────────────────────────
@@ -209,16 +210,14 @@ def _parse_datetime_value(value, offset_value=None):
     return dt
 
 
-def _parse_screenshot_filename_time(filepath):
+def _parse_image_filename_time(filepath):
     """
-    Parse common screenshot filename timestamps.
+    Parse common image filename timestamps.
 
-    This is intentionally limited to names containing 'screen' so ordinary
-    photos are not silently dated from arbitrary filename numbers.
+    This is a fallback for exported images that dropped EXIF/XMP capture dates.
+    It only accepts explicit date+time filename patterns, never bare dates.
     """
     stem = Path(filepath).stem
-    if "screen" not in stem.lower():
-        return None
 
     patterns = [
         (
@@ -242,6 +241,11 @@ def _parse_screenshot_filename_time(filepath):
             r"(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})",
             "%Y-%m-%d %H:%M:%S",
         ),
+        (
+            r"(?P<date>\d{4})(?P<month>\d{2})(?P<day>\d{2})[_-]"
+            r"(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})",
+            "%Y-%m-%d %H:%M:%S",
+        ),
     ]
 
     for pattern, fmt in patterns:
@@ -249,9 +253,10 @@ def _parse_screenshot_filename_time(filepath):
         if not match:
             continue
         parts = match.groupdict()
-        text = (
-            f"{parts['date']} {parts['hour']}:{parts['minute']}:{parts['second']}"
-        )
+        date_text = parts.get("date")
+        if parts.get("month") and parts.get("day"):
+            date_text = f"{parts['date']}-{parts['month']}-{parts['day']}"
+        text = f"{date_text} {parts['hour']}:{parts['minute']}:{parts['second']}"
         if parts.get("ampm"):
             text += f" {parts['ampm'].upper()}"
         try:
@@ -382,12 +387,12 @@ def _extract_xmp_datetime(info):
 
 def get_image_creation_time(filepath):
     """
-    Return the best available creation time for a screenshot/image.
+    Return the best available creation time for an image file.
 
-    Embedded EXIF/XMP dates are preferred. Many screenshot tools omit embedded
-    capture dates, so common screenshot filename timestamps are accepted as a
-    controlled fallback. Returned filename/EXIF datetimes are usually naive and
-    are interpreted in the user-selected timezone by resolve_unix_timestamp().
+    Embedded EXIF/XMP dates are preferred. Some export/share workflows omit
+    embedded capture dates, so common image filename timestamps are accepted as
+    a controlled fallback. Returned filename/EXIF datetimes are usually naive
+    and are interpreted in the user-selected timezone by resolve_unix_timestamp().
     """
     if PILLOW_AVAILABLE:
         try:
@@ -409,9 +414,9 @@ def get_image_creation_time(filepath):
         except OSError:
             return None, None
 
-    dt = _parse_screenshot_filename_time(filepath)
+    dt = _parse_image_filename_time(filepath)
     if dt is not None:
-        return dt, "screenshot filename"
+        return dt, "image filename"
     return None, None
 
 
@@ -738,7 +743,7 @@ def process_still(input_path, output_path, unix_ts, text_style_label, tz_offset,
 
 def process_image(input_path, output_path, unix_ts, text_style_label, tz_offset):
     """
-    Burn the timestamp overlay onto a JPEG/PNG screenshot/image.
+    Burn the timestamp overlay onto a JPEG/PNG image.
 
     Returns: (success: bool, stderr: str)
     """
@@ -788,11 +793,11 @@ def process_folder(
     Process supported files found in input_dir for the selected output mode.
 
     Args:
-        input_dir       : Source folder containing videos or screenshots.
+        input_dir       : Source folder containing videos or images.
         output_dir      : Destination folder for timestamped output.
         timezone_label  : Key from TIMEZONE_LABELS selected in the GUI.
         text_style_label: Key from TEXT_STYLE_LABELS selected in the GUI.
-        output_mode_label: OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, or OUTPUT_MODE_SCREENSHOT.
+        output_mode_label: OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, or OUTPUT_MODE_IMAGE.
         still_time_seconds: Frame time used in still mode.
         on_progress     : Optional callback(current, total, filename).
         on_result       : Optional callback(filename, device, success, message).
@@ -805,7 +810,7 @@ def process_folder(
     tz_info   = TIMEZONE_BY_LABEL[timezone_label]
     tz_offset = tz_info["offset"]
     still_mode = (output_mode_label == OUTPUT_MODE_STILL)
-    screenshot_mode = (output_mode_label == OUTPUT_MODE_SCREENSHOT)
+    image_mode = output_mode_label in (OUTPUT_MODE_IMAGE, OUTPUT_MODE_SCREENSHOT)
 
     # ── Session log ───────────────────────────────────────────────────────────
     logger = None
@@ -821,7 +826,7 @@ def process_folder(
         logger.propagate = False
 
     # ── File discovery ────────────────────────────────────────────────────────
-    allowed_extensions = IMAGE_EXTENSIONS if screenshot_mode else VIDEO_EXTENSIONS
+    allowed_extensions = IMAGE_EXTENSIONS if image_mode else VIDEO_EXTENSIONS
     files = sorted(
         f for f in input_dir.iterdir()
         if f.is_file() and f.suffix.lower() in allowed_extensions
@@ -843,8 +848,8 @@ def process_folder(
         if on_progress:
             on_progress(i, total, filepath.name)
 
-        if screenshot_mode:
-            device = "screenshot"
+        if image_mode:
+            device = "image"
             creation_time, ts_source = get_image_creation_time(filepath)
         else:
             device = detect_device(filepath)
@@ -865,7 +870,7 @@ def process_folder(
                 f"TS    {filepath.name}  [{DEVICE_LABELS[device]}]  "
                 f"source={ts_source}  display={local_display}"
             )
-        if screenshot_mode:
+        if image_mode:
             output_path = output_dir / filepath.name
             success, stderr = process_image(
                 filepath,
