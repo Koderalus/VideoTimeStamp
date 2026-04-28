@@ -44,6 +44,7 @@ class App(tk.Tk):
 
         self._config = self._load_config()
         self._queue  = queue.Queue()
+        self._ffmpeg_available = True
 
         self._build_ui()
         self._check_ffmpeg()
@@ -82,14 +83,16 @@ class App(tk.Tk):
     # ── FFmpeg check ──────────────────────────────────────────────────────────
 
     def _check_ffmpeg(self):
-        if not processor.check_ffmpeg():
+        self._ffmpeg_available = processor.check_ffmpeg()
+        if not self._ffmpeg_available:
             messagebox.showerror(
                 "FFmpeg not found",
-                "FFmpeg is required but was not found on your PATH.\n\n"
+                "FFmpeg is required for video processing but was not found on your PATH.\n\n"
                 "Run the setup script to install it:\n"
-                "    bash install.sh",
+                "    bash install.sh\n\n"
+                "Screenshot image mode can still run without FFmpeg.",
             )
-            self._process_btn.configure(state="disabled")
+            self._on_mode_change()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -163,7 +166,7 @@ class App(tk.Tk):
             mode_row,
             textvariable=self._mode_var,
             values=processor.OUTPUT_MODE_LABELS,
-            width=24,
+            width=30,
             state="readonly",
         )
         mode_box.pack(side="left")
@@ -247,10 +250,21 @@ class App(tk.Tk):
         mode = self._mode_var.get()
         state = "normal" if mode == processor.OUTPUT_MODE_STILL else "disabled"
         self._still_time_entry.configure(state=state)
+
         if mode == processor.OUTPUT_MODE_STILL:
             self._process_btn.configure(text="Extract Stills")
+        elif mode == processor.OUTPUT_MODE_SCREENSHOT:
+            self._process_btn.configure(text="Process Screenshots")
         else:
             self._process_btn.configure(text="Process Videos")
+
+        if (
+            not self._ffmpeg_available
+            and mode in (processor.OUTPUT_MODE_VIDEO, processor.OUTPUT_MODE_STILL)
+        ):
+            self._process_btn.configure(state="disabled")
+        else:
+            self._process_btn.configure(state="normal")
 
     def _parse_still_time_to_seconds(self, raw):
         text = raw.strip()
@@ -306,7 +320,7 @@ class App(tk.Tk):
                             "warn")
 
                 elif kind == "done":
-                    self._process_btn.configure(state="normal")
+                    self._on_mode_change()
 
         except queue.Empty:
             pass

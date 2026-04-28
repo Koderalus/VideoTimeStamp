@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
@@ -26,6 +26,7 @@ except ImportError:
 MAC_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.mts', '.m4v', '.wmv'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 
 TIMEZONES = [
     {
@@ -78,14 +79,16 @@ TEXT_STYLE_LABELS   = [s["label"] for s in TEXT_STYLES]
 TEXT_STYLE_BY_LABEL = {s["label"]: s for s in TEXT_STYLES}
 
 DEVICE_LABELS = {
-    "apple":   "Apple",
-    "sony":    "Sony",
-    "unknown": "Unknown",
+    "apple":      "Apple",
+    "sony":       "Sony",
+    "screenshot": "Screenshot",
+    "unknown":    "Unknown",
 }
 
 OUTPUT_MODE_VIDEO = "Video (timestamped)"
 OUTPUT_MODE_STILL = "Still image (timestamped)"
-OUTPUT_MODE_LABELS = [OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL]
+OUTPUT_MODE_SCREENSHOT = "Screenshot image (timestamped)"
+OUTPUT_MODE_LABELS = [OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, OUTPUT_MODE_SCREENSHOT]
 
 
 # ── FFmpeg / Pillow checks ────────────────────────────────────────────────────
@@ -148,6 +151,114 @@ def _parse_iso_with_offset(s):
     if sign == "-":
         offset = -offset
     return dt.replace(tzinfo=timezone(offset))
+
+
+def _clean_metadata_text(value):
+    """Normalize common EXIF/XMP text values to a plain Python string."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value).strip().strip("\x00")
+
+
+def _parse_datetime_value(value, offset_value=None):
+    """
+    Parse EXIF/XMP datetime values.
+
+    EXIF usually stores local wall time as 'YYYY:MM:DD HH:MM:SS'. Newer files
+    may also include OffsetTime tags, which make the result timezone-aware.
+    """
+    raw = _clean_metadata_text(value)
+    if not raw:
+        return None
+
+    raw = raw.replace("\x00", "").strip()
+    offset_raw = _clean_metadata_text(offset_value)
+    iso_candidate = raw.replace("Z", "+00:00")
+
+    try:
+        return datetime.fromisoformat(iso_candidate)
+    except ValueError:
+        pass
+
+    parsed = _parse_iso_with_offset(raw)
+    if parsed is not None:
+        return parsed
+
+    m = _re.match(
+        r"^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\s*([+-]\d{2}:?\d{2}))?$",
+        raw,
+    )
+    if not m:
+        return None
+
+    year, month, day, hour, minute, second, inline_offset = m.groups()
+    dt = datetime(
+        int(year), int(month), int(day),
+        int(hour), int(minute), int(second),
+    )
+    offset_text = inline_offset or offset_raw
+    offset_match = _re.match(r"^([+-])(\d{2}):?(\d{2})$", offset_text)
+    if offset_match:
+        sign, hh, mm_ = offset_match.groups()
+        offset = timedelta(hours=int(hh), minutes=int(mm_))
+        if sign == "-":
+            offset = -offset
+        dt = dt.replace(tzinfo=timezone(offset))
+    return dt
+
+
+def _parse_screenshot_filename_time(filepath):
+    """
+    Parse common screenshot filename timestamps.
+
+    This is intentionally limited to names containing 'screen' so ordinary
+    photos are not silently dated from arbitrary filename numbers.
+    """
+    stem = Path(filepath).stem
+    if "screen" not in stem.lower():
+        return None
+
+    patterns = [
+        (
+            r"(?P<date>\d{4}-\d{2}-\d{2})\s+at\s+"
+            r"(?P<hour>\d{1,2})[.:](?P<minute>\d{2})[.:](?P<second>\d{2})\s*"
+            r"(?P<ampm>AM|PM)",
+            "%Y-%m-%d %I:%M:%S %p",
+        ),
+        (
+            r"(?P<date>\d{4}-\d{2}-\d{2})[\s_-]+"
+            r"(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})",
+            "%Y-%m-%d %H:%M:%S",
+        ),
+        (
+            r"(?P<date>\d{8})[\s_-]+"
+            r"(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})",
+            "%Y%m%d %H:%M:%S",
+        ),
+        (
+            r"(?P<date>\d{4}-\d{2}-\d{2})[\s_-]+"
+            r"(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})",
+            "%Y-%m-%d %H:%M:%S",
+        ),
+    ]
+
+    for pattern, fmt in patterns:
+        match = _re.search(pattern, stem, _re.IGNORECASE)
+        if not match:
+            continue
+        parts = match.groupdict()
+        text = (
+            f"{parts['date']} {parts['hour']}:{parts['minute']}:{parts['second']}"
+        )
+        if parts.get("ampm"):
+            text += f" {parts['ampm'].upper()}"
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def get_apple_recording_time(filepath):
@@ -223,6 +334,85 @@ def get_creation_time(filepath, device_type):
         if dt is not None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt, "mvhd (UTC)"
+
+
+def _extract_xmp_datetime(info):
+    """Return the first usable datetime found in Pillow image text/XMP fields."""
+    candidate_keys = (
+        "DateTimeOriginal",
+        "DateTimeDigitized",
+        "CreateDate",
+        "CreationDate",
+        "ModifyDate",
+        "date:create",
+        "date:modify",
+    )
+    for key in candidate_keys:
+        dt = _parse_datetime_value(info.get(key))
+        if dt is not None:
+            return dt, key
+
+    xmp_values = []
+    for key in ("XML:com.adobe.xmp", "xmp"):
+        value = info.get(key)
+        if value:
+            xmp_values.append(_clean_metadata_text(value))
+
+    for xmp in xmp_values:
+        for tag in (
+            "DateTimeOriginal",
+            "DateTimeDigitized",
+            "CreateDate",
+            "CreationDate",
+            "DateCreated",
+            "ModifyDate",
+        ):
+            patterns = [
+                rf"<[^>]*{tag}[^>]*>([^<]+)</[^>]+>",
+                rf"\b[^:=\s]*{tag}\s*=\s*[\"']([^\"']+)[\"']",
+            ]
+            for pattern in patterns:
+                match = _re.search(pattern, xmp, _re.IGNORECASE)
+                if match:
+                    dt = _parse_datetime_value(match.group(1))
+                    if dt is not None:
+                        return dt, f"XMP {tag}"
+    return None, None
+
+
+def get_image_creation_time(filepath):
+    """
+    Return the best available creation time for a screenshot/image.
+
+    Embedded EXIF/XMP dates are preferred. Many screenshot tools omit embedded
+    capture dates, so common screenshot filename timestamps are accepted as a
+    controlled fallback. Returned filename/EXIF datetimes are usually naive and
+    are interpreted in the user-selected timezone by resolve_unix_timestamp().
+    """
+    if PILLOW_AVAILABLE:
+        try:
+            with Image.open(filepath) as img:
+                exif = img.getexif()
+                exif_candidates = (
+                    (36867, 36881, "EXIF DateTimeOriginal"),
+                    (36868, 36882, "EXIF DateTimeDigitized"),
+                    (306, 36880, "EXIF DateTime"),
+                )
+                for date_tag, offset_tag, source in exif_candidates:
+                    dt = _parse_datetime_value(exif.get(date_tag), exif.get(offset_tag))
+                    if dt is not None:
+                        return dt, source
+
+                dt, source = _extract_xmp_datetime(img.info)
+                if dt is not None:
+                    return dt, source
+        except OSError:
+            return None, None
+
+    dt = _parse_screenshot_filename_time(filepath)
+    if dt is not None:
+        return dt, "screenshot filename"
+    return None, None
 
 
 # ── Timezone resolution ───────────────────────────────────────────────────────
@@ -546,6 +736,41 @@ def process_still(input_path, output_path, unix_ts, text_style_label, tz_offset,
     return True, ""
 
 
+def process_image(input_path, output_path, unix_ts, text_style_label, tz_offset):
+    """
+    Burn the timestamp overlay onto a JPEG/PNG screenshot/image.
+
+    Returns: (success: bool, stderr: str)
+    """
+    if not PILLOW_AVAILABLE:
+        return False, "Pillow is not installed. Run: bash install.sh"
+
+    try:
+        with Image.open(input_path) as src:
+            img = ImageOps.exif_transpose(src).convert("RGB")
+    except OSError as exc:
+        return False, str(exc)
+
+    ts_text = format_timestamp(unix_ts, tz_offset)
+    font, font_size, edge_padding, outline_w = _build_text_style(img.width, img.height)
+    img = _draw_timestamp(img, ts_text, text_style_label, font, font_size, edge_padding, outline_w)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = output_path.suffix.lower()
+    try:
+        if suffix in (".jpg", ".jpeg"):
+            img.save(output_path, format="JPEG", quality=95)
+        elif suffix == ".png":
+            img.save(output_path, format="PNG")
+        else:
+            img.save(output_path)
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
+
+
 # ── Batch processing ──────────────────────────────────────────────────────────
 
 def process_folder(
@@ -560,14 +785,14 @@ def process_folder(
     log_dir=None,
 ):
     """
-    Process all video files found in input_dir.
+    Process supported files found in input_dir for the selected output mode.
 
     Args:
-        input_dir       : Source folder containing videos.
-        output_dir      : Destination folder for timestamped videos.
+        input_dir       : Source folder containing videos or screenshots.
+        output_dir      : Destination folder for timestamped output.
         timezone_label  : Key from TIMEZONE_LABELS selected in the GUI.
         text_style_label: Key from TEXT_STYLE_LABELS selected in the GUI.
-        output_mode_label: OUTPUT_MODE_VIDEO or OUTPUT_MODE_STILL.
+        output_mode_label: OUTPUT_MODE_VIDEO, OUTPUT_MODE_STILL, or OUTPUT_MODE_SCREENSHOT.
         still_time_seconds: Frame time used in still mode.
         on_progress     : Optional callback(current, total, filename).
         on_result       : Optional callback(filename, device, success, message).
@@ -580,6 +805,7 @@ def process_folder(
     tz_info   = TIMEZONE_BY_LABEL[timezone_label]
     tz_offset = tz_info["offset"]
     still_mode = (output_mode_label == OUTPUT_MODE_STILL)
+    screenshot_mode = (output_mode_label == OUTPUT_MODE_SCREENSHOT)
 
     # ── Session log ───────────────────────────────────────────────────────────
     logger = None
@@ -595,9 +821,10 @@ def process_folder(
         logger.propagate = False
 
     # ── File discovery ────────────────────────────────────────────────────────
+    allowed_extensions = IMAGE_EXTENSIONS if screenshot_mode else VIDEO_EXTENSIONS
     files = sorted(
         f for f in input_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        if f.is_file() and f.suffix.lower() in allowed_extensions
     )
     total = len(files)
 
@@ -616,8 +843,12 @@ def process_folder(
         if on_progress:
             on_progress(i, total, filepath.name)
 
-        device                    = detect_device(filepath)
-        creation_time, ts_source  = get_creation_time(filepath, device)
+        if screenshot_mode:
+            device = "screenshot"
+            creation_time, ts_source = get_image_creation_time(filepath)
+        else:
+            device = detect_device(filepath)
+            creation_time, ts_source = get_creation_time(filepath, device)
 
         if creation_time is None:
             msg = "No metadata timestamp — skipped"
@@ -634,7 +865,16 @@ def process_folder(
                 f"TS    {filepath.name}  [{DEVICE_LABELS[device]}]  "
                 f"source={ts_source}  display={local_display}"
             )
-        if still_mode:
+        if screenshot_mode:
+            output_path = output_dir / filepath.name
+            success, stderr = process_image(
+                filepath,
+                output_path,
+                unix_ts,
+                text_style_label,
+                tz_offset,
+            )
+        elif still_mode:
             output_path = output_dir / f"{filepath.stem}_still.jpg"
             success, stderr = process_still(
                 filepath,
