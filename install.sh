@@ -69,7 +69,7 @@ else
     echo "✓ Tk bindings installed"
 fi
 
-# ── Virtual environment + Pillow ──────────────────────────────────────────────
+# ── Virtual environment + Pillow / HEIC support ───────────────────────────────
 # Python 3.12+ blocks pip from installing into Homebrew Python directly (PEP 668).
 # A virtual environment sidesteps this cleanly.
 VENV_DIR="$SCRIPT_DIR/.venv"
@@ -83,9 +83,9 @@ fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
 
-echo "Installing Pillow (image processing library)..."
-"$VENV_PYTHON" -m pip install --quiet --upgrade Pillow
-echo "✓ Pillow installed"
+echo "Installing Pillow and HEIC support (image processing libraries)..."
+"$VENV_PYTHON" -m pip install --quiet --upgrade Pillow pillow-heif
+echo "✓ Pillow and HEIC support installed"
 
 # Write the venv Python path so run.sh always uses the right interpreter
 echo "$VENV_PYTHON" > "$SCRIPT_DIR/.python_path"

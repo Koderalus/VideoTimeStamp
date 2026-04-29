@@ -21,12 +21,22 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
+HEIF_AVAILABLE = False
+if PILLOW_AVAILABLE:
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        HEIF_AVAILABLE = True
+    except Exception:
+        HEIF_AVAILABLE = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 MAC_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.mts', '.m4v', '.wmv'}
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+HEIF_EXTENSIONS = {'.heic', '.heif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png'} | HEIF_EXTENSIONS
 
 TIMEZONES = [
     {
@@ -106,6 +116,11 @@ def check_ffmpeg():
 def check_pillow():
     """Return True if Pillow is importable."""
     return PILLOW_AVAILABLE
+
+
+def check_heif():
+    """Return True if HEIC/HEIF support is available through pillow-heif."""
+    return HEIF_AVAILABLE
 
 
 # ── Device detection ──────────────────────────────────────────────────────────
@@ -300,6 +315,42 @@ def _read_jpeg_exif_tiff(filepath):
         return None
 
 
+def _looks_like_tiff_header(data):
+    """Return True if bytes start with a valid TIFF header."""
+    if len(data) < 8:
+        return False
+    if data[:2] == b"II":
+        endian = "little"
+    elif data[:2] == b"MM":
+        endian = "big"
+    else:
+        return False
+    return int.from_bytes(data[2:4], endian) == 42
+
+
+def _read_embedded_exif_tiff(filepath):
+    """Return TIFF bytes from JPEG APP1 or a generic embedded Exif payload."""
+    tiff = _read_jpeg_exif_tiff(filepath)
+    if tiff is not None:
+        return tiff
+
+    try:
+        data = Path(filepath).read_bytes()
+    except OSError:
+        return None
+
+    start = 0
+    exif_marker = b"Exif\x00\x00"
+    while True:
+        idx = data.find(exif_marker, start)
+        if idx == -1:
+            return None
+        candidate = data[idx + len(exif_marker):]
+        if _looks_like_tiff_header(candidate):
+            return candidate
+        start = idx + 1
+
+
 def _extract_tiff_ascii(tiff, endian, entry_offset):
     """Read an ASCII TIFF entry value from an IFD entry offset."""
     typ = int.from_bytes(tiff[entry_offset + 2:entry_offset + 4], endian)
@@ -345,7 +396,7 @@ def _extract_exif_datetime(filepath):
     parser follows the nested ExifIFD pointer so DateTimeOriginal is still found
     before the filename fallback is used.
     """
-    tiff = _read_jpeg_exif_tiff(filepath)
+    tiff = _read_embedded_exif_tiff(filepath)
     if not tiff or len(tiff) < 8:
         return None, None
 
@@ -884,6 +935,8 @@ def process_image(input_path, output_path, unix_ts, text_style_label, tz_offset)
     """
     if not PILLOW_AVAILABLE:
         return False, "Pillow is not installed. Run: bash install.sh"
+    if Path(input_path).suffix.lower() in HEIF_EXTENSIONS and not HEIF_AVAILABLE:
+        return False, "HEIC/HEIF support is not installed. Run: bash install.sh"
 
     try:
         with Image.open(input_path) as src:
@@ -909,6 +962,15 @@ def process_image(input_path, output_path, unix_ts, text_style_label, tz_offset)
     except OSError as exc:
         return False, str(exc)
     return True, ""
+
+
+def _image_output_path(input_path, output_dir):
+    """Return output path for an image, converting HEIC/HEIF outputs to JPEG."""
+    input_path = Path(input_path)
+    suffix = input_path.suffix.lower()
+    if suffix in HEIF_EXTENSIONS:
+        return Path(output_dir) / f"{input_path.stem}.jpg"
+    return Path(output_dir) / input_path.name
 
 
 # ── Batch processing ──────────────────────────────────────────────────────────
@@ -975,7 +1037,8 @@ def process_folder(
             f"Style: {text_style_label} | "
             f"Mode: {output_mode_label} | "
             f"Still time: {still_time_seconds:.3f}s | "
-            f"Pillow: {PILLOW_AVAILABLE}"
+            f"Pillow: {PILLOW_AVAILABLE} | "
+            f"HEIF: {HEIF_AVAILABLE}"
         )
 
     # ── Per-file loop ─────────────────────────────────────────────────────────
@@ -1006,7 +1069,7 @@ def process_folder(
                 f"source={ts_source}  display={local_display}"
             )
         if image_mode:
-            output_path = output_dir / filepath.name
+            output_path = _image_output_path(filepath, output_dir)
             success, stderr = process_image(
                 filepath,
                 output_path,
