@@ -2,10 +2,10 @@
 
 ## Project Structure & Module Organization
 - `app.py`: Tkinter GUI entry point and user workflow.
-- `processor.py`: Core video/timestamp logic (metadata parsing, FFmpeg/Pillow pipeline). Keep this module GUI-free.
-- `install.sh`: One-time macOS setup (Homebrew, FFmpeg, Python venv, Pillow, default folders/config).
+- `processor.py`: Core video/image timestamp logic (metadata parsing, FFmpeg/Pillow/pillow-heif pipeline). Keep this module GUI-free.
+- `install.sh`: One-time macOS setup (Homebrew, FFmpeg, Python venv, Pillow, pillow-heif, default folders/config).
 - `run.sh`: Launch wrapper that uses the interpreter recorded in `.python_path`.
-- `config.json`: Persisted defaults (timezone, text style, input/output folders).
+- `config.json`: Persisted defaults (timezone, text style, output mode, still time, input/output folders).
 - Runtime folders created by setup: `input/`, `output/`, `logs/`.
 - `Scope/` contains sample assets and investigation artifacts; treat as reference data, not source code.
 
@@ -25,9 +25,19 @@
 ## Testing Guidelines
 - No automated test suite is currently committed.
 - Minimum validation for changes:
+- Run `.venv/bin/python -m py_compile app.py processor.py` or `python3 -m py_compile app.py processor.py` when the venv is unavailable.
 - Process at least one Apple `.mov` and one Sony/MP4 sample (for example from `Scope/Original/`).
-- Verify timestamp correctness, rotation handling, output playback compatibility, and session log creation in `logs/`.
+- For image-mode changes, process JPEG/PNG/HEIC samples when available and verify EXIF/XMP metadata is preferred over filename fallback.
+- Verify timestamp correctness, rotation handling, output playback/image compatibility, HEIC-to-JPEG output, and session log creation in `logs/`.
 - If you add automated tests, place them under `tests/` and use `test_*.py` naming (pytest-compatible).
+
+## Timestamp & Media Behavior
+- Video modes support `.mp4`, `.mov`, `.avi`, `.mkv`, `.mts`, `.m4v`, and `.wmv`.
+- Image mode supports `.jpg`, `.jpeg`, `.png`, `.heic`, and `.heif`.
+- HEIC/HEIF inputs require `pillow-heif`; `install.sh` installs it alongside Pillow.
+- HEIC/HEIF outputs are written as `.jpg` because HEIC encoding support is not assumed.
+- Metadata-derived timestamps must remain the primary source. For images, prefer embedded EXIF/XMP dates, including nested EXIF blocks, before using controlled filename date/time fallbacks.
+- Do not silently switch to filesystem timestamps.
 
 ## Commit & Pull Request Guidelines
 - Follow the repository’s existing commit pattern: short imperative subjects (for example, `Fix video rotation handling`).
